@@ -5,14 +5,43 @@ import Sentry
 enum SDKHarness {
     static let dsn = "https://0123456789abcdef0123456789abcdef@reports.example.test/7"
 
+    /// Suite name + cache dir from the previous `reset()` call, cleaned up at the start of
+    /// the next one. A static `atexit` hook (registered once, below) cleans up the very last
+    /// one too, so a `swift test` run leaves nothing behind in `~/Library/Preferences` or
+    /// `$TMPDIR` regardless of how many tests called `reset()`.
+    nonisolated(unsafe) private static var lastSuiteName: String?
+    nonisolated(unsafe) private static var lastCacheDirectory: URL?
+
+    private static func cleanUpLeftovers() {
+        if let name = lastSuiteName {
+            UserDefaults(suiteName: name)?.removePersistentDomain(forName: name)
+            // `removePersistentDomain` only empties the domain in cfprefsd's cache; it
+            // doesn't delete the backing plist (verified empirically: the file survives,
+            // ~49 bytes of empty bplist). Each suite name is a one-shot UUID never reopened,
+            // so it's safe to also unlink the file directly.
+            let path = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Preferences/\(name).plist")
+            try? FileManager.default.removeItem(atPath: path)
+        }
+        if let directory = lastCacheDirectory {
+            try? FileManager.default.removeItem(at: directory)
+        }
+    }
+
+    private static let registerExitCleanup: Void = {
+        atexit { SDKHarness.cleanUpLeftovers() }
+    }()
+
     /// Fresh cache dir + preference suite; SDK closed; network stubbed behind the consent gate.
     /// Callers are `@MainActor` so `CrashReporting.start` installs the hub synchronously.
     @MainActor
     static func reset(mode: RecordingURLProtocol.Mode = .accept) -> CrashReportingConfiguration {
+        _ = registerExitCleanup
+        cleanUpLeftovers()
         CrashReporting.resetForTesting()
         RecordingURLProtocol.reset(mode: mode)
         RecordingURLProtocol.installBehindConsentProtocol()
         let suite = "SDKHarness.\(UUID().uuidString)"
+        lastSuiteName = suite
         CrashReporting.preferenceDefaults = UserDefaults(suiteName: suite)!
         CrashReporting.environmentResolver = nil
         CrashReporting.testOptionsOverride = { options in
@@ -21,6 +50,7 @@ enum SDKHarness {
         }
         let cache = FileManager.default.temporaryDirectory
             .appendingPathComponent("CrashReportingTests-\(UUID().uuidString)", isDirectory: true)
+        lastCacheDirectory = cache
         return CrashReportingConfiguration(
             dsn: dsn, releaseName: "com.caplaz.Test@1.0+1", environment: "test",
             cacheDirectory: cache, tracesSampleRate: 1.0)
