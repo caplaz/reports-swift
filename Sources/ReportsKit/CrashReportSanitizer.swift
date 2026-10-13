@@ -6,7 +6,7 @@ import Sentry
 /// `beforeSend` result of a transaction back to its private `SentryTransaction` class.
 enum CrashReportSanitizer {
     static let redacted = "<redacted>"
-    static let allowedTagKeys: Set<String> = ["ps.op", "ps.error"]
+    static let allowedTagKeys: Set<String> = ["report.op", "report.error"]
     static let allowedContextKeys: [String: Set<String>] = [
         "os": ["name", "version", "build", "rooted"],
         "device": [

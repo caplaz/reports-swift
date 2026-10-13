@@ -33,7 +33,7 @@ extension SerialSuite {
     @MainActor @Test func transactionKeepsSpansAndDropsPlantedDataOnRootAndChild() async throws {
         let config = SDKHarness.reset()
         CrashReporting.start(enabled: true, configuration: config)
-        let transaction = SentrySDK.startTransaction(name: "ps.test", operation: "ui.load")
+        let transaction = SentrySDK.startTransaction(name: "report.test", operation: "ui.load")
         transaction.setData(value: "/Users/jane/root.cube", key: "file")
         transaction.setTag(value: "Jane", key: "who")
         let child = transaction.startChild(operation: "file.read", description: "/Users/jane/Client Smith.cube")
@@ -50,7 +50,7 @@ extension SerialSuite {
         let envelopes = try SDKHarness.envelopes()
         let item = try #require(envelopes.flatMap(\.items).first { $0.type == "transaction" })
         let json = try #require(item.json)
-        #expect(json["transaction"] as? String == "ps.test")
+        #expect(json["transaction"] as? String == "report.test")
         let spans = try #require(json["spans"] as? [[String: Any]])
         #expect(spans.contains { $0["op"] as? String == "file.read" })
         #expect(json["start_timestamp"] != nil)

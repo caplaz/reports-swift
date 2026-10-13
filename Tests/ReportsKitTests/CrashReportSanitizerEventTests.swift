@@ -57,7 +57,7 @@ import Testing
 
         event.user = User(userId: "installation-id-123")
         event.extra = ["path": "/Users/jane/x.cube"]
-        event.tags = ["ps.op": "exportSave", "device": "Jane's Mac"]
+        event.tags = ["report.op": "exportSave", "device": "Jane's Mac"]
         event.serverName = "Janes-MacBook-Pro.local"
         event.context = [
             "device": ["model": "Mac15,3", "arch": "arm64", "name": "Jane's MacBook Pro", "locale": "en_US"],
@@ -98,7 +98,7 @@ import Testing
         #expect(event.debugMeta?.first?.debugID == "B5E9C1D2-0000-0000-0000-000000000001")
         #expect(output.contains("Mac15,3"))
         #expect(output.contains("com.apple.main-thread"))
-        #expect(event.tags == ["ps.op": "exportSave"])
+        #expect(event.tags == ["report.op": "exportSave"])
     }
 
     @Test func dropsIdentifiersAndUnlistedContexts() {

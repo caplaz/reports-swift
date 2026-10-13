@@ -30,8 +30,11 @@ extension SerialSuite {
         let envelopes = try SDKHarness.envelopes()
         let event = try #require(envelopes.flatMap(\.items).first { $0.type == "event" }?.json)
         let tags = event["tags"] as? [String: String]
-        #expect(tags?["ps.op"] == "exportSave")
-        #expect(tags?["ps.error"]?.contains("code=4") == true)
+        #expect(tags?["report.op"] == "exportSave")
+        #expect(tags?["report.error"]?.contains("code=4") == true)
+        let exception = ((event["exception"] as? [String: Any])?["values"] as? [[String: Any]])?.first
+        #expect((exception?["mechanism"] as? [String: Any])?["type"] as? String == "report.handled")
+        #expect((event["fingerprint"] as? [String])?.first == "report")
         for envelope in envelopes {
             #expect(!envelope.text.contains("jane"))
             #expect(!envelope.text.contains("Jane"))

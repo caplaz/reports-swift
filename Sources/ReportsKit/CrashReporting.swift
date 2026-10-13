@@ -11,7 +11,7 @@ public enum CrashReporting {
     /// }
     /// ```
     ///
-    /// The raw value becomes the `ps.op` tag and part of the fingerprint, so it must be a
+    /// The raw value becomes the `report.op` tag and part of the fingerprint, so it must be a
     /// static identifier written in source code — never user data (file names, paths, text).
     public struct Operation: RawRepresentable, Hashable, Sendable {
         public let rawValue: String
@@ -57,7 +57,7 @@ public enum CrashReporting {
         }
     }
 
-    /// Reports a handled failure as `ps.op` + `configuration.describeError(error)` only —
+    /// Reports a handled failure as `report.op` + `configuration.describeError(error)` only —
     /// never the error value, its description, or `userInfo`. A no-op before `start`, while
     /// reporting is off, or when the SDK isn't running.
     public static func capture(_ error: any Error, operation: Operation) {
@@ -72,12 +72,12 @@ public enum CrashReporting {
         let description = describe(error)
         let event = Event(level: .error)
         let exception = Exception(value: CrashReportSanitizer.redacted, type: "\(operation.rawValue) \(description)")
-        let mechanism = Mechanism(type: "ps.handled")
+        let mechanism = Mechanism(type: "report.handled")
         mechanism.handled = NSNumber(value: true)
         exception.mechanism = mechanism
         event.exceptions = [exception]
-        event.tags = ["ps.op": operation.rawValue, "ps.error": description]
-        event.fingerprint = ["ps", operation.rawValue, description]
+        event.tags = ["report.op": operation.rawValue, "report.error": description]
+        event.fingerprint = ["report", operation.rawValue, description]
         return event
     }
 
