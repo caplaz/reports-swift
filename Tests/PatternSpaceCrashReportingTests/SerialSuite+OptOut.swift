@@ -7,7 +7,7 @@ extension SerialSuite {
     @MainActor private func queueOneEventOffline(_ config: CrashReportingConfiguration) async {
         CrashReporting.start(enabled: true, configuration: config)
         CrashReporting.capture(NSError(domain: NSCocoaErrorDomain, code: 1), operation: .iccExportSave)
-        await SDKHarness.flush()
+        await SDKHarness.flush(until: { SDKHarness.storedEnvelopeCount(in: config.cacheDirectory) >= 1 })
     }
 
     // (a) queued offline, opt out, back online, drain → nothing sent, still on disk
@@ -73,7 +73,7 @@ extension SerialSuite {
         CrashReporting.setEnabled(true)
         #expect(SentrySDK.isEnabled)
         CrashReporting.capture(NSError(domain: NSCocoaErrorDomain, code: 6), operation: .lutExportSave)
-        await SDKHarness.flush()
+        await SDKHarness.flush(until: { SDKHarness.delivered("event") })
         let delivered = try SDKHarness.envelopes().flatMap(\.items)
         #expect(delivered.contains { $0.type == "event" })
     }

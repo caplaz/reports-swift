@@ -22,7 +22,7 @@ extension SerialSuite {
             reason: "/Users/jane/Documents/Client Smith jane@example.com secret words",
             userInfo: ["path": "/Volumes/Work/x.icc"])
         SentrySDK.capture(exception: exception)
-        await SDKHarness.flush()
+        await SDKHarness.flush(until: { SDKHarness.delivered("event") })
         let envelopes = try SDKHarness.envelopes()
         let event = try #require(envelopes.flatMap(\.items).first { $0.type == "event" }?.json)
         let values = (event["exception"] as? [String: Any])?["values"] as? [[String: Any]]
@@ -41,21 +41,11 @@ extension SerialSuite {
         child.setTag(value: "secret words", key: "note")
         child.finish()
         transaction.finish()
-        // Deviation from plan: `SentryTracer.finish()` dispatches the actual hub capture
-        // (event build + beforeSend + envelope) asynchronously onto the hub's private queue
-        // (SentryHub.m: "the calling thread here could be the main thread... capture the
-        // transaction on a background thread"), so `SentrySDK.flush(timeout:)` called right
-        // after `finish()` can race ahead of that dispatch and see zero pending work, returning
-        // almost instantly (confirmed: without the wait below, this test fails deterministically
-        // in well under the flush timeout, with `beforeSend` observed to run only afterward).
-        // Plain `capture(event:)`/`capture(exception:)` do not hit this: those tests pass as
-        // written. Poll (same bounded-wait idiom as Task 9's `reEnableInSessionDrainsQueue`)
-        // instead of a fixed sleep so this isn't sensitive to machine speed.
-        let deadline = Date().addingTimeInterval(5)
-        while RecordingURLProtocol.bodies.isEmpty, Date() < deadline {
-            try await Task.sleep(for: .milliseconds(50))
-        }
-        await SDKHarness.flush()
+        // `SentryTracer.finish()` dispatches the hub capture (event build + beforeSend +
+        // envelope) asynchronously onto the hub's private queue, so a flush right after
+        // `finish()` can see zero pending work. `flush(until:)` also covers the transport's
+        // lost-wakeup race that affects every capture (see `SDKHarness.flush(until:)`).
+        await SDKHarness.flush(until: { SDKHarness.delivered("transaction") })
 
         let envelopes = try SDKHarness.envelopes()
         let item = try #require(envelopes.flatMap(\.items).first { $0.type == "transaction" })
@@ -72,7 +62,7 @@ extension SerialSuite {
             let config = SDKHarness.reset()
             CrashReporting.start(enabled: true, configuration: config)
             CrashReporting.capture(NSError(domain: NSCocoaErrorDomain, code: 260), operation: .lutExportPrepare)
-            await SDKHarness.flush()
+            await SDKHarness.flush(until: { SDKHarness.delivered("event") })
             let items = try SDKHarness.envelopes().flatMap(\.items)
             #expect(!items.isEmpty)
             #expect(!items.contains { $0.type == "session" })

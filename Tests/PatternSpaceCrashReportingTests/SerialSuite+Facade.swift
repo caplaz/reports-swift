@@ -25,7 +25,7 @@ extension SerialSuite {
             NSUnderlyingErrorKey: underlying
         ])
         CrashReporting.capture(error, operation: .lutExportSave)
-        await SDKHarness.flush()
+        await SDKHarness.flush(until: { SDKHarness.delivered("event") })
 
         let envelopes = try SDKHarness.envelopes()
         let event = try #require(envelopes.flatMap(\.items).first { $0.type == "event" }?.json)

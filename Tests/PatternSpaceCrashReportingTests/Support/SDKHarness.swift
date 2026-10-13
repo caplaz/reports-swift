@@ -61,6 +61,35 @@ enum SDKHarness {
         await Task.detached { SentrySDK.flush(timeout: 3) }.value
     }
 
+    /// Flushes until `condition` holds (or `seconds` pass) and returns whether it did.
+    ///
+    /// A single `SentrySDK.flush` is not a delivery barrier in sentry-cocoa 9.24.0. Every
+    /// `start` builds a new `SentryReachability` whose fresh `NWPathMonitor` reports the
+    /// initial path as a change (`.none` to `.wiFi`), so `SentryHttpTransport` runs a
+    /// `sendAllCachedEnvelopes` on the reachability queue shortly after start. If that drain
+    /// is already past `getOldestEnvelope` when the test captures and flushes, the store-then-
+    /// send and the flush's own send both bail with "Already sending", and the reachability
+    /// drain's "No envelopes left" calls `stopFlushing`. `flush` then returns success
+    /// immediately, with the new envelope still on disk and no drain left to pick it up
+    /// (a lost wakeup in the transport). Each `flush` dispatches a new drain onto the
+    /// transport queue, so flushing again delivers the stranded envelope. Conditions are
+    /// observable outcomes: bodies the recorder received, or envelope files in the cache.
+    @MainActor @discardableResult
+    static func flush(until condition: () -> Bool, seconds: Double = 5) async -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while true {
+            await flush()
+            if condition() { return true }
+            if Date() >= deadline { return false }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+    }
+
+    /// Whether the recorder has received an envelope item of `type` ("event", "transaction").
+    static func delivered(_ type: String) -> Bool {
+        ((try? envelopes()) ?? []).flatMap(\.items).contains { $0.type == type }
+    }
+
     static func envelopes() throws -> [Envelope] {
         try RecordingURLProtocol.bodies.map(Envelope.init)
     }
