@@ -35,6 +35,20 @@ extension SerialSuite {
         #expect(RecordingURLProtocol.bodies.isEmpty)
     }
 
+    @Test func bodyStreamReadErrorFailsWithNoResponse() async {
+        RecordingURLProtocol.reset()
+        RecordingURLProtocol.installBehindConsentProtocol()
+        ConsentGate.shared.setEnabled(true)
+        var request = URLRequest(url: URL(string: "https://reports.example.invalid/api/7/envelope/")!)
+        request.httpMethod = "POST"
+        request.httpBodyStream = FailingAfterFirstReadInputStream()
+        await #expect(throws: URLError.self) {
+            _ = try await outerSession().data(for: request)
+        }
+        // No truncated envelope must reach the inner (recording) protocol.
+        #expect(RecordingURLProtocol.bodies.isEmpty)
+    }
+
     @Test func optOutAfterAdmissionCancelsBeforeAnyByteIsDelivered() async throws {
         RecordingURLProtocol.reset(mode: .pauseBeforeDelivery)
         RecordingURLProtocol.installBehindConsentProtocol()

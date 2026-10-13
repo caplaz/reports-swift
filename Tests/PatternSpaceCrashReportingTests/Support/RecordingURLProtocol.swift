@@ -65,7 +65,7 @@ final class RecordingURLProtocol: URLProtocol, @unchecked Sendable {
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
-        let body = request.httpBody ?? request.httpBodyStream.map { Data(reading: $0) } ?? Data()
+        let body = request.httpBody ?? request.httpBodyStream.flatMap { Data(reading: $0) } ?? Data()
         switch Self.mode {
         case .failConnection:
             client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
