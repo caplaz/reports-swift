@@ -204,8 +204,9 @@ No user or installation identifier (the SDK's cached installation ID is stripped
 event and log), no release-health sessions (they carry an installation-derived ID and bypass
 `beforeSend`), no file names or paths, no error text beyond `describeError`, no screenshots
 or view hierarchies, no network breadcrumbs or network/file-I/O/Core Data tracing, no
-failed-request events for the app's own `URLSession`s, and no client reports. With a proxy
-DSN, Sentry sees the proxy's egress IP instead of the user's.
+failed-request events for the app's own `URLSession`s, no client reports, and no metrics
+(counters/gauges/measurements — `enableMetrics` is off; `CrashReporting` never calls the
+Metrics API). With a proxy DSN, Sentry sees the proxy's egress IP instead of the user's.
 
 ## sentry-cocoa is pinned exactly
 

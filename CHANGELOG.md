@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1 — 2026-10-13
+
+### Changed
+
+- `CrashReporting.apply` now explicitly sets `options.enableMetrics = false`: `CrashReporting` never calls the Metrics API, so the ingestion path stays off rather than relying on the SDK's default.
+
 ## 0.2.0 — 2026-10-13
 
 ### Added

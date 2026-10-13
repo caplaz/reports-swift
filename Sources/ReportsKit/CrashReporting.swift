@@ -123,6 +123,9 @@ public enum CrashReporting {
         // events (with their URLs).
         options.enableCaptureFailedRequests = false
         options.sendClientReports = false
+        // Metrics is a separate telemetry API (counters/gauges/measurements) that
+        // CrashReporting never calls; keep it off rather than ship an unused ingestion path.
+        options.enableMetrics = false
         options.enableLogs = configuration.logsEnabled
         #if os(iOS)
         // UIKit-only options in sentry-cocoa 9.24.0 (absent from the macOS slice).

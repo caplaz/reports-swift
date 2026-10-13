@@ -19,6 +19,8 @@ import Testing
         // URLs) into events.
         #expect(options.enableCaptureFailedRequests == false)
         #expect(options.sendClientReports == false)
+        // CrashReporting never calls the Metrics API; don't ship an unused ingestion path.
+        #expect(options.enableMetrics == false)
     }
 
     @Test func mapsLogsEnabledToEnableLogsAndInstallsBeforeSendLog() {
