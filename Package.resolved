@@ -1,0 +1,24 @@
+{
+  "originHash" : "e3b046dba6db79e8db7dbc85623c80461b7d3a636be31cc04fad798353b2457b",
+  "pins" : [
+    {
+      "identity" : "patternspacesdk",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/caplaz/PatternSpaceSDK.git",
+      "state" : {
+        "revision" : "36c6e4fa779033e60d648904b756d0cd15a4a30c",
+        "version" : "1.1.0"
+      }
+    },
+    {
+      "identity" : "sentry-cocoa",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/getsentry/sentry-cocoa.git",
+      "state" : {
+        "revision" : "d82bb1c5eb353a593573a5624bb370f5a1f500ce",
+        "version" : "9.24.0"
+      }
+    }
+  ],
+  "version" : 3
+}
