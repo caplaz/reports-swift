@@ -45,7 +45,7 @@ public enum CrashReporting {
             // The transport only drains its disk queue on a capture, a connectivity change,
             // or a flush; after a gate-refused send it stops. Kick a drain so reports queued
             // while consent was off (but collected while it was on) are delivered now.
-            Task.detached(priority: .utility) { SentrySDK.flush(timeout: 10) }
+            DispatchQueue.global(qos: .utility).async { SentrySDK.flush(timeout: 10) }
         } else if let configuration {
             startSDK(configuration)
         }
@@ -104,10 +104,20 @@ public enum CrashReporting {
         options.enableNetworkTracking = false
         options.enableFileIOTracing = false
         options.enableCoreDataTracing = false
+        // Default true installs SentryNetworkTrackingIntegration and swizzles URLSessionTask
+        // app-wide; failed requests from the app's own URLSessions (e.g. the contact form)
+        // would otherwise become events.
+        options.enableCaptureFailedRequests = false
+        options.sendClientReports = false
         #if os(iOS)
         // UIKit-only options in sentry-cocoa 9.24.0 (absent from the macOS slice).
         options.attachScreenshot = false
         options.attachViewHierarchy = false
+        #endif
+        #if os(macOS)
+        // AppKit swallows uncaught main-thread NSExceptions otherwise; Sentry recommends
+        // enabling this on macOS.
+        options.enableUncaughtNSExceptionReporting = true
         #endif
 
         let sessionConfiguration = URLSessionConfiguration.ephemeral
