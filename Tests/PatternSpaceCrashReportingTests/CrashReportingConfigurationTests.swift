@@ -45,4 +45,13 @@ import Testing
             cacheDirectory: URL(fileURLWithPath: "/tmp/x"))
         #expect(config.tracesSampleRate == 0.05)
     }
+
+    // The constants are empty placeholders until the real DSNs are filled in; once they are,
+    // this catches a DSN pasted from Sentry's own dashboard (*.ingest.*.sentry.io) instead of
+    // the reports.caplaz.com proxy.
+    @Test func dsnConstantsRouteThroughTheReportsProxyHost() {
+        for dsn in [CrashReportingConfiguration.macOSDSN, CrashReportingConfiguration.iOSDSN] where !dsn.isEmpty {
+            #expect(URL(string: dsn)?.host == "reports.caplaz.com")
+        }
+    }
 }
