@@ -1,7 +1,7 @@
 import Foundation
 import Sentry
 import Testing
-@testable import PatternSpaceCrashReporting
+@testable import ReportsKit
 
 extension SerialSuite {
     private static let needles = ["jane", "Jane", "Client Smith", "jane@example.com", "secret words", "/Users/", "/Volumes/"]
@@ -20,7 +20,7 @@ extension SerialSuite {
         let exception = NSException(
             name: .invalidArgumentException,
             reason: "/Users/jane/Documents/Client Smith jane@example.com secret words",
-            userInfo: ["path": "/Volumes/Work/x.icc"])
+            userInfo: ["path": "/Volumes/Work/x.profile"])
         SentrySDK.capture(exception: exception)
         await SDKHarness.flush(until: { SDKHarness.delivered("event") })
         let envelopes = try SDKHarness.envelopes()
@@ -37,7 +37,7 @@ extension SerialSuite {
         transaction.setData(value: "/Users/jane/root.cube", key: "file")
         transaction.setTag(value: "Jane", key: "who")
         let child = transaction.startChild(operation: "file.read", description: "/Users/jane/Client Smith.cube")
-        child.setData(value: "/Volumes/Work/child.icc", key: "file.path")
+        child.setData(value: "/Volumes/Work/child.profile", key: "file.path")
         child.setTag(value: "secret words", key: "note")
         child.finish()
         transaction.finish()
@@ -61,7 +61,7 @@ extension SerialSuite {
         for _ in 0..<2 {
             let config = SDKHarness.reset()
             CrashReporting.start(enabled: true, configuration: config)
-            CrashReporting.capture(NSError(domain: NSCocoaErrorDomain, code: 260), operation: .lutExportPrepare)
+            CrashReporting.capture(NSError(domain: NSCocoaErrorDomain, code: 260), operation: .exportPrepare)
             await SDKHarness.flush(until: { SDKHarness.delivered("event") })
             let items = try SDKHarness.envelopes().flatMap(\.items)
             #expect(!items.isEmpty)

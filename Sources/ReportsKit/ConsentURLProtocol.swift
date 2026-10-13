@@ -3,7 +3,7 @@ import Foundation
 /// First protocol of the URLSession handed to Sentry (`Options.urlSession`). Requests are
 /// forwarded through an inner session only when `ConsentGate.shared` admits them. A refused
 /// or revoked request fails with no HTTP response, which makes sentry-cocoa 9.24.0 keep the
-/// envelope on disk instead of sending or deleting it (spec §3).
+/// envelope on disk instead of sending or deleting it.
 final class ConsentURLProtocol: URLProtocol, @unchecked Sendable {
     /// Tests swap this for a configuration whose protocol records instead of networking.
     nonisolated(unsafe) static var innerConfiguration: URLSessionConfiguration = .ephemeral

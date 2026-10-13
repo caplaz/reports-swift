@@ -1,15 +1,6 @@
 {
-  "originHash" : "e3b046dba6db79e8db7dbc85623c80461b7d3a636be31cc04fad798353b2457b",
+  "originHash" : "d13582da0af4ab05da662f65e2339d8ad736fd2d78e8f6ee01e2df99f888e978",
   "pins" : [
-    {
-      "identity" : "patternspacesdk",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/caplaz/PatternSpaceSDK.git",
-      "state" : {
-        "revision" : "36c6e4fa779033e60d648904b756d0cd15a4a30c",
-        "version" : "1.1.0"
-      }
-    },
     {
       "identity" : "sentry-cocoa",
       "kind" : "remoteSourceControl",

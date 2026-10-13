@@ -1,7 +1,7 @@
 import Foundation
 import Sentry
 import Testing
-@testable import PatternSpaceCrashReporting
+@testable import ReportsKit
 
 @Suite struct CrashReportSanitizerSpanTests {
     @Test func descriptionKeptOnlyForAllowlistedOps() {

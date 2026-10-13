@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-@testable import PatternSpaceCrashReporting
+@testable import ReportsKit
 
 extension SerialSuite {
     private func outerSession() -> URLSession {

@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-@testable import PatternSpaceCrashReporting
+@testable import ReportsKit
 
 @Suite struct ConsentGateTests {
     private let session = URLSession(configuration: .ephemeral)

@@ -1,7 +1,7 @@
 import Foundation
 import Sentry
 
-/// Allowlist sanitizer (spec §2 "Privacy contract"). Mutates the SDK's objects in place and
+/// Allowlist sanitizer (README "Privacy guarantees"). Mutates the SDK's objects in place and
 /// returns the same instance — never a new `Event` — because sentry-cocoa casts the
 /// `beforeSend` result of a transaction back to its private `SentryTransaction` class.
 enum CrashReportSanitizer {

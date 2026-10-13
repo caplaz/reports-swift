@@ -1,12 +1,12 @@
 import Foundation
 import Sentry
 import Testing
-@testable import PatternSpaceCrashReporting
+@testable import ReportsKit
 
 extension SerialSuite {
     @MainActor private func queueOneEventOffline(_ config: CrashReportingConfiguration) async {
         CrashReporting.start(enabled: true, configuration: config)
-        CrashReporting.capture(NSError(domain: NSCocoaErrorDomain, code: 1), operation: .iccExportSave)
+        CrashReporting.capture(NSError(domain: NSCocoaErrorDomain, code: 1), operation: .profileSave)
         await SDKHarness.flush(until: { SDKHarness.storedEnvelopeCount(in: config.cacheDirectory) >= 1 })
     }
 
@@ -17,7 +17,7 @@ extension SerialSuite {
         #expect(SDKHarness.storedEnvelopeCount(in: config.cacheDirectory) >= 1)
         CrashReporting.setEnabled(false)
         RecordingURLProtocol.mode = .accept
-        CrashReporting.capture(NSError(domain: NSCocoaErrorDomain, code: 2), operation: .iccExportSave)
+        CrashReporting.capture(NSError(domain: NSCocoaErrorDomain, code: 2), operation: .profileSave)
         await SDKHarness.flush()
         #expect(RecordingURLProtocol.bodies.isEmpty)
         #expect(SDKHarness.storedEnvelopeCount(in: config.cacheDirectory) >= 1)
@@ -40,7 +40,7 @@ extension SerialSuite {
     @MainActor @Test func optOutDuringAdmittedUploadKeepsEnvelope() async {
         let config = SDKHarness.reset(mode: .pauseBeforeDelivery)
         CrashReporting.start(enabled: true, configuration: config)
-        CrashReporting.capture(NSError(domain: NSCocoaErrorDomain, code: 3), operation: .decklinkStart)
+        CrashReporting.capture(NSError(domain: NSCocoaErrorDomain, code: 3), operation: .deviceStart)
         #expect(await RecordingURLProtocol.waitForArrival())
         CrashReporting.setEnabled(false)
         #expect(await RecordingURLProtocol.waitForStop())   // cancellation reached the protocol
@@ -72,7 +72,7 @@ extension SerialSuite {
         CrashReporting.start(enabled: false, configuration: config)
         CrashReporting.setEnabled(true)
         #expect(SentrySDK.isEnabled)
-        CrashReporting.capture(NSError(domain: NSCocoaErrorDomain, code: 6), operation: .lutExportSave)
+        CrashReporting.capture(NSError(domain: NSCocoaErrorDomain, code: 6), operation: .exportSave)
         await SDKHarness.flush(until: { SDKHarness.delivered("event") })
         let delivered = try SDKHarness.envelopes().flatMap(\.items)
         #expect(delivered.contains { $0.type == "event" })

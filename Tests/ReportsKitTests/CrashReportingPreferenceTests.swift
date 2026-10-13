@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-@testable import PatternSpaceCrashReporting
+@testable import ReportsKit
 
 @Suite struct CrashReportingPreferenceTests {
     private func freshDefaults() -> UserDefaults {

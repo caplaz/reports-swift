@@ -1,16 +1,22 @@
 import Foundation
-import PatternSpaceCore
 import Sentry
 
-/// The only entry point the apps use; the only file family that imports Sentry (spec §2).
+/// The only entry point apps use; the only file family that imports Sentry.
 public enum CrashReporting {
-    /// Closed set of handled-error sites. Raw values become the `ps.op` tag.
-    public enum Operation: String, Sendable {
-        case lutExportPrepare
-        case lutExportSave
-        case iccExportSave
-        case iccProfileExport
-        case decklinkStart
+    /// A handled-error site. Apps declare their own:
+    ///
+    /// ```swift
+    /// extension CrashReporting.Operation {
+    ///     static let exportSave = Self("exportSave")
+    /// }
+    /// ```
+    ///
+    /// The raw value becomes the `ps.op` tag and part of the fingerprint, so it must be a
+    /// static identifier written in source code — never user data (file names, paths, text).
+    public struct Operation: RawRepresentable, Hashable, Sendable {
+        public let rawValue: String
+        public init(rawValue: String) { self.rawValue = rawValue }
+        public init(_ rawValue: String) { self.rawValue = rawValue }
     }
 
     private static let lock = NSLock()
@@ -51,15 +57,19 @@ public enum CrashReporting {
         }
     }
 
-    /// Reports a handled failure as `ps.op` + `PatternSpaceLog.describe(error)` only — never
-    /// the error value, its description, or `userInfo`.
+    /// Reports a handled failure as `ps.op` + `configuration.describeError(error)` only —
+    /// never the error value, its description, or `userInfo`. A no-op before `start`, while
+    /// reporting is off, or when the SDK isn't running.
     public static func capture(_ error: any Error, operation: Operation) {
-        guard ConsentGate.shared.isEnabled, SentrySDK.isEnabled else { return }
-        SentrySDK.capture(event: makeEvent(error: error, operation: operation))
+        guard let configuration = lock.withLock({ Self.configuration }),
+              ConsentGate.shared.isEnabled, SentrySDK.isEnabled else { return }
+        SentrySDK.capture(event: makeEvent(error: error, operation: operation, describe: configuration.describeError))
     }
 
-    static func makeEvent(error: any Error, operation: Operation) -> Event {
-        let description = PatternSpaceLog.describe(error)
+    static func makeEvent(
+        error: any Error, operation: Operation, describe: (any Error) -> String
+    ) -> Event {
+        let description = describe(error)
         let event = Event(level: .error)
         let exception = Exception(value: CrashReportSanitizer.redacted, type: "\(operation.rawValue) \(description)")
         let mechanism = Mechanism(type: "ps.handled")
@@ -71,13 +81,6 @@ public enum CrashReporting {
         return event
     }
 
-    /// Resolves the real environment after start; tests replace it with nil (no StoreKit).
-    /// Returns nil to mean "leave the scope's current environment alone" (see
-    /// `CrashReportingConfiguration.resolvedEnvironmentOverride`).
-    nonisolated(unsafe) static var environmentResolver: (@Sendable () async -> String?)? = {
-        CrashReportingConfiguration.resolvedEnvironmentOverride(for: await EntitlementEnvironment.current())
-    }
-
     /// Must run on the main thread: sentry-cocoa 9.24.0 installs the hub synchronously only
     /// when started on main (off-main it dispatches the install asynchronously).
     private static func startSDK(_ configuration: CrashReportingConfiguration) {
@@ -85,7 +88,7 @@ public enum CrashReporting {
         ConsentGate.shared.setEnabled(true)
         SentrySDK.start { options in apply(configuration, to: options) }
         lock.withLock { sdkStarted = true }
-        if let resolver = environmentResolver {
+        if let resolver = configuration.environmentResolver {
             Task.detached(priority: .utility) {
                 guard let name = await resolver() else { return }
                 SentrySDK.configureScope { $0.setEnvironment(name) }
@@ -107,8 +110,8 @@ public enum CrashReporting {
         options.enableFileIOTracing = false
         options.enableCoreDataTracing = false
         // Default true installs SentryNetworkTrackingIntegration and swizzles URLSessionTask
-        // app-wide; failed requests from the app's own URLSessions (e.g. the contact form)
-        // would otherwise become events.
+        // app-wide; failed requests from the app's own URLSessions would otherwise become
+        // events (with their URLs).
         options.enableCaptureFailedRequests = false
         options.sendClientReports = false
         #if os(iOS)
@@ -152,6 +155,5 @@ public enum CrashReporting {
         }
         testOptionsOverride = nil
         preferenceDefaults = .standard
-        environmentResolver = nil
     }
 }

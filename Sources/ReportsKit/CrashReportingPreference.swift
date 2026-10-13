@@ -1,6 +1,6 @@
 import Foundation
 
-/// The "Send crash reports" setting. Default on (spec §3).
+/// The "Send crash reports" setting. Default on (opt-out).
 public enum CrashReportingPreference {
     public static let key = "crashReportingEnabled"
 

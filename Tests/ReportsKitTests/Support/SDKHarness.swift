@@ -1,6 +1,6 @@
 import Foundation
 import Sentry
-@testable import PatternSpaceCrashReporting
+@testable import ReportsKit
 
 enum SDKHarness {
     static let dsn = "https://0123456789abcdef0123456789abcdef@reports.example.test/7"
@@ -34,7 +34,10 @@ enum SDKHarness {
     /// Fresh cache dir + preference suite; SDK closed; network stubbed behind the consent gate.
     /// Callers are `@MainActor` so `CrashReporting.start` installs the hub synchronously.
     @MainActor
-    static func reset(mode: RecordingURLProtocol.Mode = .accept) -> CrashReportingConfiguration {
+    static func reset(
+        mode: RecordingURLProtocol.Mode = .accept,
+        environmentResolver: (@Sendable () async -> String?)? = nil
+    ) -> CrashReportingConfiguration {
         _ = registerExitCleanup
         cleanUpLeftovers()
         CrashReporting.resetForTesting()
@@ -43,7 +46,6 @@ enum SDKHarness {
         let suite = "SDKHarness.\(UUID().uuidString)"
         lastSuiteName = suite
         CrashReporting.preferenceDefaults = UserDefaults(suiteName: suite)!
-        CrashReporting.environmentResolver = nil
         CrashReporting.testOptionsOverride = { options in
             options.enableCrashHandler = false   // don't install signal handlers in the test runner
             options.enableAppHangTracking = false
@@ -52,8 +54,9 @@ enum SDKHarness {
             .appendingPathComponent("CrashReportingTests-\(UUID().uuidString)", isDirectory: true)
         lastCacheDirectory = cache
         return CrashReportingConfiguration(
-            dsn: dsn, releaseName: "com.caplaz.Test@1.0+1", environment: "test",
-            cacheDirectory: cache, tracesSampleRate: 1.0)
+            dsn: dsn, releaseName: "com.example.Test@1.0+1", environment: "test",
+            cacheDirectory: cache, tracesSampleRate: 1.0,
+            describeError: TestErrors.describe, environmentResolver: environmentResolver)
     }
 
     /// `flush` blocks; run it off the main actor so SDK main-queue work can proceed.

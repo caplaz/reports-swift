@@ -2,32 +2,32 @@
 import PackageDescription
 
 let package = Package(
-    name: "PatternSpaceCrashReporting",
+    name: "reports-swift",
     platforms: [
         .macOS("15.4"),
         .iOS("18.4")
     ],
     products: [
-        .library(name: "PatternSpaceCrashReporting", targets: ["PatternSpaceCrashReporting"])
+        .library(name: "ReportsKit", targets: ["ReportsKit"])
     ],
     dependencies: [
-        .package(path: "../PatternSpaceCore"),
         // Exact pin: the consent gate and sanitizer depend on 9.24.0 transport/serialization
-        // behavior. Re-run this package's tests on every bump (spec §2).
+        // behavior (envelopes kept on disk only for connection-level failures, `close()`
+        // flushing, installation-ID user, session envelopes bypassing `beforeSend`). Re-run
+        // this package's tests on every bump.
         .package(url: "https://github.com/getsentry/sentry-cocoa.git", exact: "9.24.0")
     ],
     targets: [
         .target(
-            name: "PatternSpaceCrashReporting",
+            name: "ReportsKit",
             dependencies: [
-                .product(name: "PatternSpaceCore", package: "PatternSpaceCore"),
                 .product(name: "Sentry", package: "sentry-cocoa")
             ]
         ),
         .testTarget(
-            name: "PatternSpaceCrashReportingTests",
+            name: "ReportsKitTests",
             dependencies: [
-                "PatternSpaceCrashReporting",
+                "ReportsKit",
                 .product(name: "Sentry", package: "sentry-cocoa")
             ]
         )

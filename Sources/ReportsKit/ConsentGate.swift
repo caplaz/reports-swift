@@ -1,6 +1,6 @@
 import Foundation
 
-/// Admission and revocation of crash-report uploads under one lock (spec §3). A task is
+/// Admission and revocation of crash-report uploads under one lock. A task is
 /// recorded as admitted before the lock is released, so `setEnabled(false)` either prevents
 /// admission or sees — and cancels — the task.
 final class ConsentGate: @unchecked Sendable {

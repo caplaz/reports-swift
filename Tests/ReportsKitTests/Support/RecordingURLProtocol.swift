@@ -1,5 +1,5 @@
 import Foundation
-@testable import PatternSpaceCrashReporting
+@testable import ReportsKit
 
 /// Stand-in for the network behind `ConsentURLProtocol`. Records delivered bodies.
 final class RecordingURLProtocol: URLProtocol, @unchecked Sendable {

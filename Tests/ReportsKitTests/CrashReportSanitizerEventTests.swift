@@ -1,12 +1,12 @@
 import Foundation
 import Sentry
 import Testing
-@testable import PatternSpaceCrashReporting
+@testable import ReportsKit
 
 @Suite struct CrashReportSanitizerEventTests {
     static let planted = [
         "jane", "Jane", "Client Smith", "jane@example.com", "secret words",
-        "/Users/", "/Volumes/", "Containers/com.caplaz", "file%3A", "file://"
+        "/Users/", "/Volumes/", "Containers/com.example", "file%3A", "file://"
     ]
 
     static func json(_ event: Event) throws -> String {
@@ -21,16 +21,16 @@ import Testing
             type: "NSInvalidArgumentException")
         let mechanism = Mechanism(type: "nsexception")
         mechanism.desc = "file:///Volumes/Work/Client%20Smith"
-        mechanism.data = ["path": "/Users/jane/x.icc"]
+        mechanism.data = ["path": "/Users/jane/x.profile"]
         mechanism.helpLink = "file:///Users/jane"
         exception.mechanism = mechanism
 
-        let appPath = "/Users/jane/Applications/PatternSpace.app/Contents/MacOS/PatternSpace"
+        let appPath = "/Users/jane/Applications/MyApp.app/Contents/MacOS/MyApp"
         let frame = Frame()
-        frame.function = "LUTChainSession.exportICC(to:isPro:)"
+        frame.function = "ExportSession.export(to:options:)"
         frame.instructionAddress = "0x0000000100001234"
         frame.package = appPath
-        frame.fileName = "/Users/jane/src/LUTChainSession.swift"
+        frame.fileName = "/Users/jane/src/ExportSession.swift"
         frame.contextLine = "let secret words = jane"
         frame.preContext = ["jane"]
         frame.postContext = ["jane"]
@@ -52,23 +52,23 @@ import Testing
         image.imageSize = 4096
         image.codeFile = appPath
         let containerImage = DebugMeta()
-        containerImage.codeFile = "/private/var/containers/Bundle/Application/1A2B3C4D-5E6F/PatternSpaceIOS.app/PatternSpaceIOS"
+        containerImage.codeFile = "/private/var/containers/Bundle/Application/1A2B3C4D-5E6F/MyAppIOS.app/MyAppIOS"
         event.debugMeta = [image, containerImage]
 
         event.user = User(userId: "installation-id-123")
         event.extra = ["path": "/Users/jane/x.cube"]
-        event.tags = ["ps.op": "lutExportSave", "device": "Jane's Mac"]
+        event.tags = ["ps.op": "exportSave", "device": "Jane's Mac"]
         event.serverName = "Janes-MacBook-Pro.local"
         event.context = [
             "device": ["model": "Mac15,3", "arch": "arm64", "name": "Jane's MacBook Pro", "locale": "en_US"],
             "os": ["name": "macOS", "version": "26.0", "build": "25A100", "kernel_version": "Darwin jane"],
-            "app": ["app_version": "2.3", "app_build": "417", "device_app_hash": "abcdef", "app_identifier": "com.caplaz.PatternSpace"],
+            "app": ["app_version": "2.3", "app_build": "417", "device_app_hash": "abcdef", "app_identifier": "com.example.MyApp"],
             "culture": ["locale": "en_US", "timezone": "Europe/Rome"],
             "custom": ["path": "/Users/jane"]
         ]
         let crumb = Breadcrumb(level: .info, category: "ui.lifecycle")
         crumb.message = "opened /Users/jane/Client Smith.cube"
-        crumb.setData(value: "LUTToolsWindow", key: "screen")
+        crumb.setData(value: "ToolsWindow", key: "screen")
         crumb.setData(value: "/Users/jane/x", key: "path")
         event.breadcrumbs = [crumb]
         event.message = SentryMessage(formatted: "jane@example.com secret words")
@@ -90,15 +90,15 @@ import Testing
         #expect(event.exceptions?.first?.value == "<redacted>")
         #expect(event.exceptions?.first?.mechanism?.type == "nsexception")
         let frame = try #require(event.threads?.first?.stacktrace?.frames.first)
-        #expect(frame.function == "LUTChainSession.exportICC(to:isPro:)")
+        #expect(frame.function == "ExportSession.export(to:options:)")
         #expect(frame.instructionAddress == "0x0000000100001234")
-        #expect(frame.package == "PatternSpace")
+        #expect(frame.package == "MyApp")
         #expect(frame.fileName == nil)
-        #expect(event.debugMeta?.map(\DebugMeta.codeFile) == ["PatternSpace", "PatternSpaceIOS"])
+        #expect(event.debugMeta?.map(\DebugMeta.codeFile) == ["MyApp", "MyAppIOS"])
         #expect(event.debugMeta?.first?.debugID == "B5E9C1D2-0000-0000-0000-000000000001")
         #expect(output.contains("Mac15,3"))
         #expect(output.contains("com.apple.main-thread"))
-        #expect(event.tags == ["ps.op": "lutExportSave"])
+        #expect(event.tags == ["ps.op": "exportSave"])
     }
 
     @Test func dropsIdentifiersAndUnlistedContexts() {
