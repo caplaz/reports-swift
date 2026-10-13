@@ -16,7 +16,9 @@ import Testing
         let crumb = Breadcrumb(level: .info, category: "ui.lifecycle")
         crumb.type = "navigation"
         crumb.message = "jane"
-        crumb.data = ["screen": "SettingsRoot", "state": "viewDidAppear", "to": "/Users/jane"]
+        crumb.setData(value: "SettingsRoot", key: "screen")
+        crumb.setData(value: "viewDidAppear", key: "state")
+        crumb.setData(value: "/Users/jane", key: "to")
         let result = try #require(CrashReportSanitizer.sanitize(crumb))
         #expect(result.message == nil)
         #expect(result.category == "ui.lifecycle")

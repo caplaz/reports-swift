@@ -68,7 +68,8 @@ import Testing
         ]
         let crumb = Breadcrumb(level: .info, category: "ui.lifecycle")
         crumb.message = "opened /Users/jane/Client Smith.cube"
-        crumb.data = ["screen": "LUTToolsWindow", "path": "/Users/jane/x"]
+        crumb.setData(value: "LUTToolsWindow", key: "screen")
+        crumb.setData(value: "/Users/jane/x", key: "path")
         event.breadcrumbs = [crumb]
         event.message = SentryMessage(formatted: "jane@example.com secret words")
         event.error = NSError(domain: NSCocoaErrorDomain, code: 4, userInfo: [NSFilePathErrorKey: "/Users/jane/x"])
