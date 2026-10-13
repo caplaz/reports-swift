@@ -72,8 +72,10 @@ public enum CrashReporting {
     }
 
     /// Resolves the real environment after start; tests replace it with nil (no StoreKit).
-    nonisolated(unsafe) static var environmentResolver: (@Sendable () async -> String)? = {
-        CrashReportingConfiguration.environmentName(for: await EntitlementEnvironment.current())
+    /// Returns nil to mean "leave the scope's current environment alone" (see
+    /// `CrashReportingConfiguration.resolvedEnvironmentOverride`).
+    nonisolated(unsafe) static var environmentResolver: (@Sendable () async -> String?)? = {
+        CrashReportingConfiguration.resolvedEnvironmentOverride(for: await EntitlementEnvironment.current())
     }
 
     /// Must run on the main thread: sentry-cocoa 9.24.0 installs the hub synchronously only
@@ -85,7 +87,7 @@ public enum CrashReporting {
         lock.withLock { sdkStarted = true }
         if let resolver = environmentResolver {
             Task.detached(priority: .utility) {
-                let name = await resolver()
+                guard let name = await resolver() else { return }
                 SentrySDK.configureScope { $0.setEnvironment(name) }
             }
         }

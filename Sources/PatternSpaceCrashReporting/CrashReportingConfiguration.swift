@@ -61,6 +61,24 @@ public struct CrashReportingConfiguration: Sendable, Equatable {
         }
     }
 
+    /// What to write over the scope's initial environment once `EntitlementEnvironment`
+    /// resolves after start, or `nil` to leave the initial value (`appStore()` hardcodes
+    /// "production") alone.
+    ///
+    /// `EntitlementEnvironment.current()` returns `.xcode` both for a genuine Xcode-run app
+    /// and whenever its `AppTransaction` lookup fails (no verified transaction, or the
+    /// lookup throws) — Core has no way to tell those apart, and this function doesn't
+    /// change that. Crash reporting only starts in Release builds
+    /// (`CrashReportingBootstrap.start()` is `#if !DEBUG`), where a genuine Xcode-run
+    /// Release build is rare and a transient lookup failure (offline, receipt not yet
+    /// cached) is comparatively common. So here — where `.xcode` can only ever downgrade a
+    /// real production/TestFlight user to "development" — treat it as an untrustworthy
+    /// result and keep the initial environment instead.
+    static func resolvedEnvironmentOverride(for environment: EntitlementEnvironment) -> String? {
+        guard environment != .xcode else { return nil }
+        return environmentName(for: environment)
+    }
+
     /// SDK cache (`Options.cacheDirectoryPath`). Deleted on launch when reporting is off.
     public static func defaultCacheDirectory() -> URL {
         FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]

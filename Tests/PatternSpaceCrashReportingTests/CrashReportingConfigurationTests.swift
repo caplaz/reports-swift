@@ -19,6 +19,22 @@ import Testing
         #expect(CrashReportingConfiguration.environmentName(for: .xcode) == "development")
     }
 
+    // `EntitlementEnvironment.current()` returns `.xcode` both for a genuine Xcode-run app
+    // and for a lookup failure (no verified AppTransaction, or the lookup throwing), and
+    // crash reporting only ever starts in Release builds (CrashReportingBootstrap is
+    // `#if !DEBUG`), so a `.xcode` result there is overwhelmingly a lookup failure. The
+    // resolver must not use it to downgrade a real production/TestFlight user to
+    // "development" — it returns nil (keep the initial environment) instead.
+    @Test func resolvedEnvironmentOverrideKeepsInitialEnvironmentOnXcodeResult() {
+        #expect(CrashReportingConfiguration.resolvedEnvironmentOverride(for: .xcode) == nil)
+    }
+
+    @Test func resolvedEnvironmentOverrideMatchesEnvironmentNameOtherwise() {
+        #expect(CrashReportingConfiguration.resolvedEnvironmentOverride(for: .production) == "production")
+        #expect(CrashReportingConfiguration.resolvedEnvironmentOverride(for: .sandbox) == "testflight")
+        #expect(CrashReportingConfiguration.resolvedEnvironmentOverride(for: .testFlight) == "testflight")
+    }
+
     @Test func cacheDirectoryIsAppOwned() {
         #expect(CrashReportingConfiguration.defaultCacheDirectory().lastPathComponent == "CrashReporting")
     }
