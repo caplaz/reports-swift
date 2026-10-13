@@ -21,6 +21,19 @@ import Testing
         #expect(options.sendClientReports == false)
     }
 
+    @Test func mapsLogsEnabledToEnableLogsAndInstallsBeforeSendLog() {
+        for enabled in [true, false] {
+            let configuration = CrashReportingConfiguration(
+                dsn: "https://k@reports.example.com/1", releaseName: "r", environment: "e",
+                cacheDirectory: URL(fileURLWithPath: "/tmp/x"), logsEnabled: enabled,
+                describeError: TestErrors.describe)
+            let options = Options()
+            CrashReporting.apply(configuration, to: options)
+            #expect(options.enableLogs == enabled)
+            #expect(options.beforeSendLog != nil)
+        }
+    }
+
     #if os(macOS)
     @Test func enablesUncaughtNSExceptionReportingOnMacOS() {
         let configuration = CrashReportingConfiguration(

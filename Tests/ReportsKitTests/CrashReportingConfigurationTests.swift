@@ -43,3 +43,26 @@ import Testing
         #expect(config.describeError(NSError(domain: NSCocoaErrorDomain, code: 4)).contains("code=4"))
     }
 }
+
+@Suite struct CrashReportingConfigurationLogsTests {
+    @Test func logsAreEnabledByDefault() throws {
+        let config = CrashReportingConfiguration(
+            dsn: "https://k@reports.example.com/1", releaseName: "r", environment: "e",
+            cacheDirectory: URL(fileURLWithPath: "/tmp/x"), describeError: TestErrors.describe)
+        #expect(config.logsEnabled)
+        let standard = try #require(CrashReportingConfiguration.standard(
+            dsn: "https://k@reports.example.com/1", describeError: TestErrors.describe))
+        #expect(standard.logsEnabled)
+    }
+
+    @Test func logsCanBeTurnedOff() throws {
+        let config = CrashReportingConfiguration(
+            dsn: "https://k@reports.example.com/1", releaseName: "r", environment: "e",
+            cacheDirectory: URL(fileURLWithPath: "/tmp/x"), logsEnabled: false,
+            describeError: TestErrors.describe)
+        #expect(!config.logsEnabled)
+        let standard = try #require(CrashReportingConfiguration.standard(
+            dsn: "https://k@reports.example.com/1", logsEnabled: false, describeError: TestErrors.describe))
+        #expect(!standard.logsEnabled)
+    }
+}

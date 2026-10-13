@@ -24,6 +24,7 @@ public enum CrashReporting {
     nonisolated(unsafe) private static var sdkStarted = false
     nonisolated(unsafe) static var preferenceDefaults: UserDefaults = .standard
     nonisolated(unsafe) static var testOptionsOverride: ((Options) -> Void)?
+    nonisolated(unsafe) static var logThrottle = LogThrottle()
 
     /// Call first thing at launch, on the main thread. With `enabled == false` the SDK is not
     /// started and its cache — reports captured earlier but never delivered — is deleted.
@@ -64,6 +65,14 @@ public enum CrashReporting {
         guard let configuration = lock.withLock({ Self.configuration }),
               ConsentGate.shared.isEnabled, SentrySDK.isEnabled else { return }
         SentrySDK.capture(event: makeEvent(error: error, operation: operation, describe: configuration.describeError))
+    }
+
+    /// The configuration when a log may be sent now: started, consent on, SDK running, and
+    /// `logsEnabled`.
+    static func canLog() -> CrashReportingConfiguration? {
+        guard let configuration = lock.withLock({ Self.configuration }), configuration.logsEnabled,
+              ConsentGate.shared.isEnabled, SentrySDK.isEnabled else { return nil }
+        return configuration
     }
 
     static func makeEvent(
@@ -114,6 +123,7 @@ public enum CrashReporting {
         // events (with their URLs).
         options.enableCaptureFailedRequests = false
         options.sendClientReports = false
+        options.enableLogs = configuration.logsEnabled
         #if os(iOS)
         // UIKit-only options in sentry-cocoa 9.24.0 (absent from the macOS slice).
         options.attachScreenshot = false
@@ -137,6 +147,10 @@ public enum CrashReporting {
             guard ConsentGate.shared.isEnabled else { return nil }
             return CrashReportSanitizer.sanitize(breadcrumb)
         }
+        options.beforeSendLog = { log in
+            guard ConsentGate.shared.isEnabled else { return nil }
+            return CrashReportSanitizer.sanitize(log: log, expected: PendingLog.current)
+        }
         options.beforeSendSpan = { span in
             CrashReportSanitizer.sanitize(span: span)
             return span
@@ -155,5 +169,6 @@ public enum CrashReporting {
         }
         testOptionsOverride = nil
         preferenceDefaults = .standard
+        logThrottle = LogThrottle()
     }
 }

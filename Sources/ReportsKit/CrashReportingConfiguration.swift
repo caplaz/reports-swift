@@ -13,9 +13,12 @@ public struct CrashReportingConfiguration: Sendable {
     /// SDK cache (`Options.cacheDirectoryPath`). Deleted at launch when reporting is off.
     public var cacheDirectory: URL
     public var tracesSampleRate: Double
+    /// Whether `CrashReporting.log` sends structured logs (`Options.enableLogs`). Default `true`.
+    public var logsEnabled: Bool
     /// The **only** error text that leaves the device for a handled error (`report.error`
-    /// tag, exception type, fingerprint). It must never include paths, file names, URLs,
-    /// `localizedDescription`, `userInfo` values or any other user content — format only
+    /// tag, exception type, fingerprint; log body and `report.error` log attribute). It must
+    /// never include paths, file names, URLs, `localizedDescription`, `userInfo` values or any
+    /// other user content — format only
     /// static information such as the error's type name, an allowlisted domain and numeric
     /// codes.
     public var describeError: @Sendable (any Error) -> String
@@ -29,6 +32,7 @@ public struct CrashReportingConfiguration: Sendable {
         environment: String,
         cacheDirectory: URL,
         tracesSampleRate: Double = 0.05,
+        logsEnabled: Bool = true,
         describeError: @escaping @Sendable (any Error) -> String,
         environmentResolver: (@Sendable () async -> String?)? = nil
     ) {
@@ -37,6 +41,7 @@ public struct CrashReportingConfiguration: Sendable {
         self.environment = environment
         self.cacheDirectory = cacheDirectory
         self.tracesSampleRate = tracesSampleRate
+        self.logsEnabled = logsEnabled
         self.describeError = describeError
         self.environmentResolver = environmentResolver
     }
@@ -47,6 +52,7 @@ public struct CrashReportingConfiguration: Sendable {
         dsn: String,
         bundle: Bundle = .main,
         environment: String = "production",
+        logsEnabled: Bool = true,
         describeError: @escaping @Sendable (any Error) -> String,
         environmentResolver: (@Sendable () async -> String?)? = nil
     ) -> CrashReportingConfiguration? {
@@ -56,6 +62,7 @@ public struct CrashReportingConfiguration: Sendable {
             releaseName: releaseName(info: bundle.infoDictionary ?? [:]),
             environment: environment,
             cacheDirectory: defaultCacheDirectory(),
+            logsEnabled: logsEnabled,
             describeError: describeError,
             environmentResolver: environmentResolver
         )
