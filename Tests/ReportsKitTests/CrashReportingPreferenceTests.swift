@@ -20,4 +20,34 @@ import Testing
         #expect(!CrashReportingPreference.isEnabled(in: defaults))
         #expect(defaults.object(forKey: "crashReportingEnabled") as? Bool == false)
     }
+
+    @Test func detailedDiagnosticsDefaultsToOff() {
+        #expect(!CrashReportingPreference.isDetailedDiagnosticsEnabled(in: freshDefaults()))
+    }
+
+    @Test func persistsDetailedDiagnostics() {
+        let defaults = freshDefaults()
+        CrashReportingPreference.setDetailedDiagnostics(true, in: defaults)
+        #expect(CrashReportingPreference.isDetailedDiagnosticsEnabled(in: defaults))
+        #expect(defaults.object(forKey: "crashReportingDetailedDiagnostics") as? Bool == true)
+    }
+
+    @Test func lastProfileDefaultsToStrictAndRoundTrips() {
+        let defaults = freshDefaults()
+        #expect(CrashReportingPreference.lastProfile(in: defaults) == .strict)
+        CrashReportingPreference.setLastProfile(.diagnostic, in: defaults)
+        #expect(CrashReportingPreference.lastProfile(in: defaults) == .diagnostic)
+        defaults.set("garbage", forKey: CrashReportingPreference.lastProfileKey)
+        #expect(CrashReportingPreference.lastProfile(in: defaults) == .strict)
+    }
+
+    @Test func pendingPurgeDefaultsToNoneAndRoundTrips() {
+        let defaults = freshDefaults()
+        #expect(!CrashReportingPreference.hasPendingPurge(in: defaults))
+        CrashReportingPreference.setPendingPurge(true, in: defaults)
+        #expect(CrashReportingPreference.hasPendingPurge(in: defaults))
+        CrashReportingPreference.setPendingPurge(false, in: defaults)
+        #expect(!CrashReportingPreference.hasPendingPurge(in: defaults))
+        #expect(defaults.object(forKey: CrashReportingPreference.pendingPurgeKey) == nil)
+    }
 }
