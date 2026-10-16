@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.0 — 2026-10-16
+
+### Added
+
+- Privacy profiles: `CrashReporting.PrivacyProfile` (`.strict`, the default, and `.diagnostic`) and `CrashReporting.activeProfile`. The profile is chosen once per SDK start from the stored settings: `.diagnostic` only when "Send crash reports" and the new "Share detailed diagnostics" (`CrashReportingPreference.isDetailedDiagnosticsEnabled`, `CrashReporting.setDetailedDiagnosticsEnabled`, default off) are both on.
+- `.diagnostic` sends the error's own text and file/URL user info in handled errors (exception value and `report.error.detail` on error logs), keeps exception reasons, frame file names and full image paths, keeps breadcrumb messages, attaches the installation ID as `user.id`, and sends sessions with the installation ID. It also enables the metrics ingestion path behind the consent gate (`beforeSendMetric`); ReportsKit has no metrics producer yet, so nothing is sent either way today. Device name, IP, screenshots and view hierarchy are never sent.
+- `CrashReporting.forwardLog(_:category:message:)`: forwards app log lines in `.diagnostic` only, with `report.category`, budgeted (identical line once per 10 s, 120/min, 5,000/process, `report.dropped` count) and emitted off the caller's thread.
+- Event tag `report.profile`: set on the scope at every start (so stored crash and hang reports keep the profile they were collected under) and rewritten to the profile actually applied before sending.
+
+### Changed
+
+- Release-health sessions are now on in both profiles. In `.strict`, ReportsKit deletes sentry-cocoa's `INSTALLATION` file before every start, so each launch's sessions carry a new random `did` that cannot be linked across launches (Crash Free Sessions is accurate; Crash Free Users counts launches).
+- Going from `.diagnostic` back to `.strict` deletes everything queued but not yet sent before the SDK starts; events collected by an earlier launch (crashes, hangs, at any level) are sanitized with the more private of their own `report.profile` tag and the current profile, untagged ones as `.strict`.
+- Whole-cache deletions (reporting off at launch, or a downgrade) are recorded as pending until they succeed; the SDK does not start while one is pending.
+- Release-health sessions follow consent: ReportsKit starts and ends them itself (auto session tracking off), closes a force-quit launch's session as abnormal, and turning reporting off ends the session, pauses app-hang tracking and marks the scope `report.consent=off` so nothing collected while off is ever sent.
+- Tracing (`tracesSampleRate`) is now gated by consent independently of profile: a transaction is sampled only while reporting is on, and `beforeSend` drops one that spans or finishes during an opted-out interval even if it is processed after re-enable.
+
 ## 0.2.2 — 2026-10-16
 
 ### Fixed

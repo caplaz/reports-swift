@@ -7,7 +7,10 @@ Privacy-first crash reporting for Apple-platform apps. `ReportsKit` is a thin fa
   allowlist before it is written to disk or sent;
 - enforces the user's **opt-out at the transport level**, so nothing leaves the device once
   reporting is turned off — not even reports that were already queued;
-- never attaches a **stable identifier** for the user or the device.
+- never attaches a **stable identifier** for the user or the device in the default `strict`
+  privacy profile. A user can opt in to a `diagnostic` profile that adds error text, file
+  names, the app's own log lines and a random installation identifier (see
+  [Privacy profiles](#privacy-profiles)).
 
 It is meant to be used with a DSN whose host is a reverse proxy you control (for example
 [`reports.caplaz.com`](https://github.com/caplaz/reports-proxy), a Cloudflare Worker), so the
@@ -18,7 +21,7 @@ Requires macOS 15.4+ / iOS 18.4+, Swift 5.10+.
 ## Installation
 
 ```swift
-.package(url: "https://github.com/caplaz/reports-swift.git", from: "0.2.0")
+.package(url: "https://github.com/caplaz/reports-swift.git", from: "0.3.0")
 ```
 
 and add the `ReportsKit` product to your app target.
@@ -147,7 +150,74 @@ do {
   the SDK's log pipeline — `SentrySDK.logger` called directly, a logging-framework bridge —
   is dropped by the sanitizer.
 
+### 6. Detailed diagnostics (optional)
+
+Offer a second, opt-in setting next to the first one. It is stored by ReportsKit and read
+when the SDK starts, so a change applies at the next launch:
+
+```swift
+Toggle("Share detailed diagnostics", isOn: Binding(
+    get: { CrashReportingPreference.isDetailedDiagnosticsEnabled() },
+    set: { CrashReporting.setDetailedDiagnosticsEnabled($0) }
+))
+.disabled(!CrashReportingPreference.isEnabled())
+```
+
+With both settings on at start, `CrashReporting.activeProfile == .diagnostic`. Forward your
+app's own log lines (info and above) only then:
+
+```swift
+if CrashReporting.activeProfile == .diagnostic {
+    myLogger.onLine = { level, category, message in
+        CrashReporting.forwardLog(level, category: category, message: message)
+    }
+}
+```
+
+`forwardLog` is a no-op in `strict`, while reporting is off, or with `logsEnabled: false`.
+It is budgeted (an identical line once per 10 s, 120 lines per minute, 5,000 per process;
+the next sent line carries `report.dropped`) and emits on a background queue, so it is safe
+on hot threads. Tell users exactly what the setting sends — see the table below.
+
 ## Privacy guarantees
+
+### Privacy profiles
+
+| | `strict` (default) | `diagnostic` (opt-in) |
+|---|---|---|
+| Handled-error text | `describeError` only | + the error's own description and file/URL user info (exception value) |
+| Stack frames / images | image last path component | + frame file names, full image paths |
+| Logs | `CrashReporting.log` only | + `forwardLog` lines (`report.category`), `report.error.detail` |
+| Installation ID | stripped everywhere | `user.id` on events and logs |
+| Sessions | yes, random ID per launch | yes, installation ID |
+| Metrics | off | ingestion path enabled, consent-gated — unused today (ReportsKit has no metrics producer yet) |
+| Device name, IP, screenshots, view hierarchy | never | never |
+
+The profile is chosen once per SDK start: `diagnostic` only when both
+`CrashReportingPreference.isEnabled()` and `isDetailedDiagnosticsEnabled()` are on. There is
+no override. When a launch goes from `diagnostic` back to `strict`, or starts with reporting
+off, everything collected but not yet sent is deleted before the SDK starts; if that deletion
+fails (fail-closed), it stays pending and the SDK does not start until it succeeds. Every
+launch tags its scope with `report.profile`, which crash and hang reports keep from the
+moment they are collected; a report replayed later is sanitized with the more private of that
+tag and the current profile (untagged = `strict`). The tag sent is the profile actually
+applied.
+
+Release-health sessions run only while reporting is on. In `strict`, sentry-cocoa's
+`INSTALLATION` file (the session `did` and the default `user.id`) is deleted at every start,
+so each launch gets a new random, unlinkable session identifier; the first launch after
+opting into `diagnostic` deletes and regenerates it too, so the new stable diagnostic
+identifier is never retroactively linked to an earlier anonymous session, after which it
+stays stable across diagnostic launches. A session left open by a force quit is closed as
+abnormal at the next start.
+
+Turning reporting off marks the scope `report.consent=off` (never sent) and pauses app-hang
+tracking, marking the scope `report.hangs=off` for the rest of the process so a hang whose
+detection straddles the opt-out is dropped too; anything collected under either marker — say,
+a crash during the opted-out period, replayed at the next launch — is dropped. Tracing
+(`tracesSampleRate`) is gated by consent the same way, independent of profile: a transaction
+is sampled only while reporting is on, and one that spans or finishes during an opted-out
+interval is still dropped before sending, even if its processing runs after re-enable.
 
 ### Allowlist sanitizer
 
@@ -200,24 +270,31 @@ instead of sending or deleting it.
 
 ### What is not sent
 
-No user or installation identifier (the SDK's cached installation ID is stripped from every
-event and log), no release-health sessions (they carry an installation-derived ID and bypass
-`beforeSend`), no file names or paths, no error text beyond `describeError`, no screenshots
-or view hierarchies, no network breadcrumbs or network/file-I/O/Core Data tracing, no
-failed-request events for the app's own `URLSession`s, no client reports, and no metrics
-(counters/gauges/measurements — `enableMetrics` is off; `CrashReporting` never calls the
-Metrics API). With a proxy DSN, Sentry sees the proxy's egress IP instead of the user's.
+In the `strict` profile: no user or installation identifier (the SDK's installation ID is
+stripped from every event and log, and the file holding it is deleted at every start, so
+release-health sessions carry an identifier that is new for each launch), no file names or
+paths, no error text beyond `describeError`, no forwarded app logs, no metrics. In every
+profile: no screenshots or view hierarchies, no device or computer name, no network
+breadcrumbs or network/file-I/O/Core Data tracing, no failed-request events for the app's
+own `URLSession`s, and no client reports. `CrashReporting` has no metrics producer, so no
+metrics are sent in either profile today even though `diagnostic` enables the ingestion path.
+With a proxy DSN, Sentry sees the proxy's egress IP instead of the user's.
 
 ## sentry-cocoa is pinned exactly
 
 `Package.swift` pins sentry-cocoa with `exact: "9.24.0"`. The consent gate and sanitizer rely
 on behaviors of that version: envelopes are kept on disk only for connection-level failures
 (any HTTP 4xx/5xx deletes them), `close()` flushes, events and logs carry a cached
-installation-ID user, session envelopes bypass `beforeSend`, transactions are re-serialized
-from the root tracer after `beforeSend`, and `beforeSendLog` runs synchronously on the
-thread that emitted the log (see `docs/specs/2026-10-13-logs-design.md`). **Bumping the version requires re-running the full test suite**
-(`swift test --no-parallel`), and any change in those behaviors must be handled before
-releasing.
+installation-ID user, the installation ID (session `did`) lives in
+`<cacheDirectory>/INSTALLATION` and is regenerated when that file is missing, crash and
+stored-hang reports keep their collection-time scope tags and the current scope never
+overrides them, the `@_spi(Private)` session/file-manager/envelope API `CachedSessionRecovery`
+uses to close a force-quit launch's session (the hub's own method isn't public), session
+envelopes bypass `beforeSend`, transactions are re-serialized from the root tracer after
+`beforeSend`, and `beforeSendLog` runs synchronously on the thread that emitted the log (see
+`docs/specs/2026-10-13-logs-design.md`). **Bumping the version requires re-running the full
+test suite** (`swift test --no-parallel`), and any change in those behaviors must be handled
+before releasing.
 
 ### Known SDK race
 
