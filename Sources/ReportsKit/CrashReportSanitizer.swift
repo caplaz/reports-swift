@@ -33,6 +33,7 @@ enum CrashReportSanitizer {
     static let logErrorKey = "report.error"
     static let logSourceKey = "report.source"
     static let logSource = "reportskit"
+    static let logEnvironmentKey = "sentry.environment"
     /// Attributes sentry-cocoa 9.24.0's scope applier adds that identify nothing about the
     /// user or the device instance. Everything else it adds — `user.id` (the installation ID),
     /// `user.name`, `user.email`, `sentry.replay_id`, scope attributes — is stripped.
@@ -107,7 +108,12 @@ enum CrashReportSanitizer {
     /// Keeps only a log that ReportsKit is emitting on this thread right now (`expected`),
     /// carrying our marker, with the same level and body; rebuilds its attributes from
     /// `expected` plus the SDK allowlist. Returns `nil` (drop) for anything else.
-    static func sanitize(log: SentryLog, expected: ExpectedLog?) -> SentryLog? {
+    ///
+    /// `environment`, when present, overrides the `sentry.environment` attribute sentry-cocoa's
+    /// scope applier set from `Options.environment` at `start` — it never re-reads the scope, so
+    /// a resolved `CrashReportingConfiguration.environmentResolver` name never reaches logs on
+    /// its own (unlike events, which do pick it up via `configureScope`).
+    static func sanitize(log: SentryLog, expected: ExpectedLog?, environment: String? = nil) -> SentryLog? {
         guard let expected,
               log.attributes[logSourceKey]?.value as? String == logSource,
               expected.attributes[logSourceKey] == logSource,
@@ -116,6 +122,9 @@ enum CrashReportSanitizer {
         var attributes = log.attributes.filter { allowedLogSDKAttributeKeys.contains($0.key) }
         for (key, value) in expected.attributes {
             attributes[key] = SentryAttribute(string: value)
+        }
+        if let environment {
+            attributes[logEnvironmentKey] = SentryAttribute(string: environment)
         }
         log.attributes = attributes
         log.body = expected.body

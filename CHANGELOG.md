@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2 — 2026-10-16
+
+### Fixed
+
+- Logs sent via `CrashReporting.log` now carry the environment resolved by `CrashReportingConfiguration.environmentResolver` in their `sentry.environment` attribute, matching error/crash events from the same process. sentry-cocoa 9.24.0's log scope applier (`TelemetryScopeApplier.addDefaultAttributes`) sets that attribute from `Options.environment` captured at `start` and never re-reads the scope, so `configureScope { $0.setEnvironment(name) }` — which does reach events — left logs stuck on the startup environment (e.g. `production` instead of `testflight`) once the resolver returned. The facade now stores the resolved name and `beforeSendLog` overrides the attribute with it.
+
 ## 0.2.1 — 2026-10-13
 
 ### Changed

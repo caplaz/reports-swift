@@ -25,6 +25,12 @@ public enum CrashReporting {
     nonisolated(unsafe) static var preferenceDefaults: UserDefaults = .standard
     nonisolated(unsafe) static var testOptionsOverride: ((Options) -> Void)?
     nonisolated(unsafe) static var logThrottle = LogThrottle()
+    /// `environmentResolver`'s result, once it returns. sentry-cocoa 9.24.0's log scope
+    /// applier (`TelemetryScopeApplier.addDefaultAttributes`) sets a log's `sentry.environment`
+    /// attribute from `Options.environment` captured at `start`, not from the scope — so
+    /// `configureScope { $0.setEnvironment(name) }` (below) affects events but never logs. The
+    /// sanitizer reads this value to override the attribute on the log path.
+    nonisolated(unsafe) private static var resolvedEnvironment: String?
 
     /// Call first thing at launch, on the main thread. With `enabled == false` the SDK is not
     /// started and its cache — reports captured earlier but never delivered — is deleted.
@@ -100,6 +106,7 @@ public enum CrashReporting {
         if let resolver = configuration.environmentResolver {
             Task.detached(priority: .utility) {
                 guard let name = await resolver() else { return }
+                lock.withLock { resolvedEnvironment = name }
                 SentrySDK.configureScope { $0.setEnvironment(name) }
             }
         }
@@ -152,7 +159,8 @@ public enum CrashReporting {
         }
         options.beforeSendLog = { log in
             guard ConsentGate.shared.isEnabled else { return nil }
-            return CrashReportSanitizer.sanitize(log: log, expected: PendingLog.current)
+            let environment = lock.withLock { resolvedEnvironment }
+            return CrashReportSanitizer.sanitize(log: log, expected: PendingLog.current, environment: environment)
         }
         options.beforeSendSpan = { span in
             CrashReportSanitizer.sanitize(span: span)
@@ -169,6 +177,7 @@ public enum CrashReporting {
         lock.withLock {
             configuration = nil
             sdkStarted = false
+            resolvedEnvironment = nil
         }
         testOptionsOverride = nil
         preferenceDefaults = .standard

@@ -158,6 +158,33 @@ extension SerialSuite {
         #expect(!SDKHarness.delivered("log"))
     }
 
+    /// sentry-cocoa 9.24.0's log scope applier sets a log's `sentry.environment` from
+    /// `Options.environment` captured at `start`, not from the scope — so a resolved
+    /// `environmentResolver` name (which events pick up via `configureScope`) would otherwise
+    /// never reach logs. Regression test for that gap.
+    @MainActor @Test func errorLogEnvironmentUsesTheResolvedEnvironmentNotTheStartupOne() async throws {
+        let config = SDKHarness.reset(environmentResolver: { "testflight" })
+        CrashReporting.start(enabled: true, configuration: config)
+        // The resolver runs on a detached task after start and applies to the scope
+        // asynchronously; bounded-poll via a capture (as SerialSuite+Facade does) until an
+        // event shows the resolved environment, confirming the scope has caught up, before
+        // emitting the log under test.
+        let deadline = Date().addingTimeInterval(5)
+        var environment: String?
+        repeat {
+            CrashReporting.capture(NSError(domain: NSCocoaErrorDomain, code: 11), operation: .exportSave)
+            await SDKHarness.flush(until: { SDKHarness.delivered("event") })
+            environment = try SDKHarness.envelopes().flatMap(\.items)
+                .last { $0.type == "event" }?.json?["environment"] as? String
+        } while environment != "testflight" && Date() < deadline
+        #expect(environment == "testflight")
+
+        CrashReporting.log(.error, "sentinel", operation: .exportSave)
+        #expect(await SDKHarness.flush(until: { SDKHarness.delivered("log") }))
+        let log = try #require(try Self.logItems().first)
+        #expect(Self.attributeValues(log)["sentry.environment"] == "testflight")
+    }
+
     @MainActor @Test func logBeforeStartIsANoOp() {
         _ = SDKHarness.reset()
         CrashReporting.log(.error, "early", operation: .exportSave)

@@ -78,6 +78,14 @@ import Testing
         ])
     }
 
+    @Test func environmentOverrideReplacesTheSDKEnvironmentAttribute() throws {
+        let sanitized = try #require(CrashReportSanitizer.sanitize(
+            log: Self.sdkEnriched(Self.errorLog), expected: Self.errorLog, environment: "testflight"))
+        let values = Self.stringValues(sanitized)
+        #expect(values["sentry.environment"] == "testflight")
+        #expect(Set(values.keys).isSubset(of: CrashReportSanitizer.allowedLogAttributeKeys))
+    }
+
     @Test func ourAttributesComeFromTheExpectedLogNotTheIncomingOne() throws {
         let incoming = Self.sdkEnriched(Self.errorLog)
         incoming.setAttribute(SentryAttribute(string: "/Users/jane"), forKey: "report.error")
