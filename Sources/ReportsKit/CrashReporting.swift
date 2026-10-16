@@ -35,23 +35,42 @@ public enum CrashReporting {
     /// The profile the SDK started with. sentry-cocoa reads `Options` once, at `start`, so it
     /// is fixed for the rest of the process.
     nonisolated(unsafe) private static var startedProfile: PrivacyProfile = .strict
+    /// Set by `setDetailedDiagnosticsEnabled(false)`: the process stays strict from then on,
+    /// even if the setting is turned back on (that applies at the next SDK start). Cleared
+    /// when the SDK starts.
+    nonisolated(unsafe) private static var detailedDiagnosticsRevoked = false
 
     /// sentry-cocoa 9.24.0 keeps the installation ID — every session's `did` and the default
     /// `user.id` — in this file directly under `Options.cacheDirectoryPath`
     /// (`SentryInstallation.swift`), and generates a new random one when it is missing.
     static let installationFileName = "INSTALLATION"
 
-    /// The profile the running SDK uses; `.strict` before the SDK starts.
+    /// What the running SDK may send now: `.strict` before the SDK starts; otherwise the
+    /// profile it started with, downgraded to `.strict` for the rest of the process once
+    /// "Share detailed diagnostics" is turned off (spec §3.4).
     public static var activeProfile: PrivacyProfile {
-        lock.withLock { sdkStarted ? startedProfile : .strict }
+        let started = lock.withLock { sdkStarted ? startedProfile : .strict }
+        return PrivacyProfile.mostPrivate(started, currentSettingProfile())
     }
 
-    /// Call first thing at launch, on the main thread. With `enabled == false` the SDK is not
-    /// started and its cache — reports captured earlier but never delivered — is deleted; if
-    /// the deletion fails it stays pending and the next SDK start completes it before starting
-    /// (or doesn't start). With `enabled == true` the profile is `.diagnostic` when
-    /// `CrashReportingPreference.isDetailedDiagnosticsEnabled()` is on, else `.strict`.
+    /// The profile the detailed-diagnostics setting allows in this process right now:
+    /// `.strict` once it was turned off in-process, or while the stored setting is off (which
+    /// also catches a direct `CrashReportingPreference.setDetailedDiagnostics(false)` write).
+    static func currentSettingProfile() -> PrivacyProfile {
+        let revoked = lock.withLock { detailedDiagnosticsRevoked }
+        return !revoked && CrashReportingPreference.isDetailedDiagnosticsEnabled(in: preferenceDefaults)
+            ? .diagnostic : .strict
+    }
+
+    /// Call first thing at launch, **on the main thread** (traps otherwise). With
+    /// `enabled == false` the SDK is not started and its cache — reports captured earlier but
+    /// never delivered — is deleted; if the deletion fails it stays pending and the next SDK
+    /// start completes it before starting (or doesn't start). With `enabled == true` the
+    /// profile is `.diagnostic` when both stored settings —
+    /// `CrashReportingPreference.isEnabled()` and `isDetailedDiagnosticsEnabled()` — are on,
+    /// else `.strict`.
     public static func start(enabled: Bool, configuration: CrashReportingConfiguration) {
+        dispatchPrecondition(condition: .onQueue(.main))
         consentTransitionLock.lock()
         defer { consentTransitionLock.unlock() }
         // A launch: unless an SDK is actually running, nothing has started yet. Otherwise a
@@ -75,14 +94,39 @@ public enum CrashReporting {
         }
     }
 
-    /// Settings toggle. Off blocks and cancels uploads immediately and never calls
-    /// `SentrySDK.close()` (it flushes). On resumes the gate or starts the SDK.
+    /// "Send crash reports" toggle. Call **on the main thread** (traps otherwise). Persists the
+    /// choice and applies it immediately: off blocks and cancels uploads and never calls
+    /// `SentrySDK.close()` (it flushes); on resumes the gate, or starts the SDK in this process
+    /// if it isn't running (launched with reporting off).
     public static func setEnabled(_ enabled: Bool) {
-        // One ordered transition (review finding): the preference write, consent marker, hang
-        // tracking, gate, session effects and trace generation change together, so overlapping
-        // enable/disable calls from any threads end in the state of the last call.
-        consentTransitionLock.lock()
-        defer { consentTransitionLock.unlock() }
+        dispatchPrecondition(condition: .onQueue(.main))
+        // One ordered transition at a time (review finding): the preference write, consent
+        // marker, hang tracking, gate, session effects and trace generation change together.
+        // A call made from inside a running transition (on main: an observer or callback
+        // reacting synchronously to it) is not run nested — it is queued and applied right
+        // after the running one, so overlapping calls end in the state of the last call.
+        if transitionRunning {
+            pendingTransition = enabled
+            return
+        }
+        transitionRunning = true
+        defer { transitionRunning = false }
+        var next: Bool? = enabled
+        while let value = next {
+            pendingTransition = nil
+            consentTransitionLock.withLock { applyConsent(value) }
+            afterTransitionForTesting?(value)
+            next = pendingTransition
+        }
+    }
+
+    /// Main-thread-only state of `setEnabled`: a transition is running, and the value of the
+    /// last call made while it ran (applied when it finishes).
+    nonisolated(unsafe) private static var transitionRunning = false
+    nonisolated(unsafe) private static var pendingTransition: Bool?
+
+    /// One consent transition. Runs under `consentTransitionLock`.
+    private static func applyConsent(_ enabled: Bool) {
         CrashReportingPreference.set(enabled, in: preferenceDefaults)
         guard enabled else {
             // End the consented session first (its final update covers only time while
@@ -113,7 +157,7 @@ public enum CrashReporting {
         }
         let (configuration, started) = lock.withLock { (Self.configuration, sdkStarted) }
         if started && SentrySDK.isEnabled {
-            afterConsentMarkerRemovedForTesting?()
+            beforeConsentMarkerRemovedForTesting?()
             SentrySDK.configureScope { $0.removeTag(key: CrashReportSanitizer.consentTagKey) }
             // App-hang tracking stays paused and `report.hangs=off` stays on the scope for the
             // rest of this process (see the opt-out branch).
@@ -129,23 +173,53 @@ public enum CrashReporting {
         }
     }
 
-    /// Serializes `setEnabled` end to end. Recursive: `setEnabled(true)` may call `startSDK`,
-    /// which never re-enters `setEnabled`, but a recursive lock keeps that safe if it ever does.
+    /// Serializes `start` and consent transitions. Every caller is on the main thread (and a
+    /// nested `setEnabled` is queued, not run inside), so this never blocks in practice; it is
+    /// never held while waiting for the main thread. Recursive in case `startSDK` ever
+    /// re-enters.
     private static let consentTransitionLock = NSRecursiveLock()
 
     /// Test seam: runs inside an enabling transition, before the consent marker is removed.
-    nonisolated(unsafe) static var afterConsentMarkerRemovedForTesting: (() -> Void)?
+    nonisolated(unsafe) static var beforeConsentMarkerRemovedForTesting: (() -> Void)?
+    /// Test seam: runs on main after each applied transition, with its value.
+    nonisolated(unsafe) static var afterTransitionForTesting: ((Bool) -> Void)?
 
-    /// "Share detailed diagnostics" toggle. Persists the choice; the running SDK keeps its
-    /// profile, and the choice applies the next time the SDK starts.
+    /// "Share detailed diagnostics" toggle. Call **on the main thread** (traps otherwise).
+    /// Persists the choice.
+    /// - Off applies immediately: from now on this process sends only what `.strict` allows —
+    ///   events, breadcrumbs and logs are sanitized as strict (no error text, paths, breadcrumb
+    ///   messages or `user.id`), `forwardLog` stops, and the scope's `report.profile` becomes
+    ///   `strict` so crash reports collected from now on are strict when replayed. Release-health
+    ///   sessions keep the `did` they started with until the next start (sentry-cocoa can't
+    ///   change it in-process). Reports queued before the change (already sanitized when
+    ///   captured) are still delivered.
+    /// - On applies at the next SDK start (the next launch, or `setEnabled(true)` if the SDK
+    ///   isn't running yet); after an in-process off, this process stays strict.
     public static func setDetailedDiagnosticsEnabled(_ enabled: Bool) {
-        CrashReportingPreference.setDetailedDiagnostics(enabled, in: preferenceDefaults)
+        dispatchPrecondition(condition: .onQueue(.main))
+        consentTransitionLock.withLock {
+            CrashReportingPreference.setDetailedDiagnostics(enabled, in: preferenceDefaults)
+            guard !enabled else { return }
+            let running = lock.withLock { () -> Bool in
+                // Only a running SDK has diagnostic state to revoke; before start, the stored
+                // setting alone decides the profile `startSDK` picks.
+                guard sdkStarted else { return false }
+                detailedDiagnosticsRevoked = true
+                return true
+            }
+            if running && SentrySDK.isEnabled {
+                SentrySDK.configureScope {
+                    $0.setTag(value: PrivacyProfile.strict.rawValue, key: CrashReportSanitizer.profileTagKey)
+                }
+            }
+        }
     }
 
-    /// Reports a handled failure as `report.op` + `configuration.describeError(error)`. In the
-    /// diagnostic profile the exception value also carries `ErrorDetail.text(for: error)`;
-    /// grouping (`report.error`, fingerprint) never depends on the profile. A no-op before
-    /// `start`, while reporting is off, or when the SDK isn't running.
+    /// Reports a handled failure as `report.op` + `configuration.describeError(error)`. While
+    /// `activeProfile` is `.diagnostic` the exception value also carries
+    /// `ErrorDetail.text(for: error)`; grouping (`report.error`, fingerprint) never depends on
+    /// the profile. A no-op before `start`, while reporting is off, or when the SDK isn't
+    /// running.
     public static func capture(_ error: any Error, operation: Operation) {
         guard let configuration = lock.withLock({ Self.configuration }),
               ConsentGate.shared.isEnabled, SentrySDK.isEnabled else { return }
@@ -182,8 +256,10 @@ public enum CrashReporting {
     /// when started on main (off-main it dispatches the install asynchronously).
     private static func startSDK(_ configuration: CrashReportingConfiguration) {
         precondition(Thread.isMainThread, "CrashReporting must start on the main thread")
-        let requested: PrivacyProfile =
-            CrashReportingPreference.isDetailedDiagnosticsEnabled(in: preferenceDefaults) ? .diagnostic : .strict
+        // Both stored settings (review finding): `start(enabled: true)` is given the app's own
+        // flag, which need not match the stored "Send crash reports".
+        let requested: PrivacyProfile = CrashReportingPreference.isEnabled(in: preferenceDefaults)
+            && CrashReportingPreference.isDetailedDiagnosticsEnabled(in: preferenceDefaults) ? .diagnostic : .strict
         let previous = CrashReportingPreference.lastProfile(in: preferenceDefaults)
         guard prepareCache(configuration.cacheDirectory, profile: requested, previous: previous) else {
             // Fail closed (spec §3.2): a privacy-required deletion failed — a pending purge
@@ -199,16 +275,25 @@ public enum CrashReporting {
             return
         }
         CrashReportingPreference.setLastProfile(requested, in: preferenceDefaults)
-        lock.withLock { startedProfile = requested }
+        lock.withLock {
+            startedProfile = requested
+            detailedDiagnosticsRevoked = false
+        }
         ConsentGate.shared.setEnabled(true)
         // Tracing consent opens with the gate, before integrations install (review finding:
         // otherwise every launch sampled nothing until a toggle off/on).
         TraceConsent.shared.setConsented(true)
         // `apply` also puts `report.profile = requested` on the initial scope, so every event and
         // every crash/hang report collected by this launch carries it (spec §3.3).
-        SentrySDK.start { options in apply(configuration, profile: requested, to: options) }
+        // `Options.sessionTrackingIntervalMillis` (default 30 s); `start` runs the closure
+        // synchronously on main.
+        var sessionInterval: TimeInterval = 30
+        SentrySDK.start { options in
+            apply(configuration, profile: requested, to: options)
+            sessionInterval = TimeInterval(options.sessionTrackingIntervalMillis) / 1_000
+        }
         lock.withLock { sdkStarted = true }
-        ConsentSessionTracker.shared.install()
+        ConsentSessionTracker.shared.install(sessionInterval: sessionInterval)
         ConsentSessionTracker.shared.consentGranted()
         if let resolver = configuration.environmentResolver {
             Task.detached(priority: .utility) {
@@ -286,9 +371,11 @@ public enum CrashReporting {
         options.enableAutoSessionTracking = false
         options.enableAppHangTracking = true
         // Tracing is gated by consent with clock-free provenance (spec §3.2d): a transaction is
-        // sampled only while consent is on, and its trace ID is admitted to the current
-        // consent generation; revocation clears the generation, and `beforeSend` sends a
-        // transaction only if its trace ID is still admitted. Covers transactions started while
+        // sampled (the SDK rolls `rate`) only while consent is on, and its identity is admitted
+        // to the current consent generation; revocation clears the generation, and
+        // `beforeSend` sends a transaction only if its identity is still admitted. A
+        // transaction created with an explicit `sampled` decision skips `tracesSampler`
+        // (`SentrySampling.m` `sentry_sampleTrace`), is never admitted, and is dropped. Covers transactions started while
         // off (never sampled) and ones spanning or finishing during an opted-out interval,
         // even when their processing runs after re-enable (`SentryHub.m:335-360`).
         // Only with a positive rate: a sampler alone turns tracing on (`Options.isTracingEnabled`)
@@ -351,7 +438,9 @@ public enum CrashReporting {
             if event.type == "transaction", !TraceConsent.shared.consume(key: TraceConsent.rootKey(of: event)) {
                 return nil
             }
-            let applied = eventProfile(for: event, started: profile)
+            // Also no more detail than the current setting allows (detailed diagnostics turned
+            // off in this process applies at once).
+            let applied = PrivacyProfile.mostPrivate(eventProfile(for: event, started: profile), currentSettingProfile())
             // The tag sent is the profile actually applied, not the one claimed at collection.
             var tags = event.tags ?? [:]
             tags[CrashReportSanitizer.profileTagKey] = applied.rawValue
@@ -360,20 +449,24 @@ public enum CrashReporting {
         }
         options.beforeBreadcrumb = { breadcrumb in
             guard ConsentGate.shared.isEnabled else { return nil }
-            return CrashReportSanitizer.sanitize(breadcrumb, profile: profile)
+            return CrashReportSanitizer.sanitize(
+                breadcrumb, profile: PrivacyProfile.mostPrivate(profile, currentSettingProfile()))
         }
         options.beforeSendLog = { log in
             guard ConsentGate.shared.isEnabled else { return nil }
             let environment = lock.withLock { resolvedEnvironment }
             return CrashReportSanitizer.sanitize(
-                log: log, expected: PendingLog.current, environment: environment, profile: profile)
+                log: log, expected: PendingLog.current, environment: environment,
+                profile: PrivacyProfile.mostPrivate(profile, currentSettingProfile()))
         }
         options.beforeSendSpan = { span in
             CrashReportSanitizer.sanitize(span: span)
             return span
         }
         if profile == .diagnostic {
-            options.beforeSendMetric = { metric in ConsentGate.shared.isEnabled ? metric : nil }
+            options.beforeSendMetric = { metric in
+                ConsentGate.shared.isEnabled && currentSettingProfile() == .diagnostic ? metric : nil
+            }
         }
         testOptionsOverride?(options)
     }
@@ -398,7 +491,8 @@ public enum CrashReporting {
         forwardQueue.sync {}   // no forwarded log from the previous test may reach the next SDK
         ConsentSessionTracker.shared.resetForTesting()
         TraceConsent.shared.resetForTesting()
-        afterConsentMarkerRemovedForTesting = nil
+        beforeConsentMarkerRemovedForTesting = nil
+        afterTransitionForTesting = nil
         SentrySDK.close()
         ConsentGate.shared.setEnabled(false)
         lock.withLock {
@@ -406,6 +500,7 @@ public enum CrashReporting {
             sdkStarted = false
             resolvedEnvironment = nil
             startedProfile = .strict
+            detailedDiagnosticsRevoked = false
         }
         testOptionsOverride = nil
         removeItem = { try FileManager.default.removeItem(at: $0) }

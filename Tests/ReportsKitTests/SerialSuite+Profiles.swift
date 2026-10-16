@@ -47,6 +47,18 @@ extension SerialSuite {
         #expect(CrashReportingPreference.lastProfile(in: CrashReporting.preferenceDefaults) == .diagnostic)
     }
 
+    // Review finding: the requested profile needs BOTH stored settings, whatever `enabled`
+    // the app passes to `start`.
+    @MainActor @Test func startWithStoredReportingOffIsStrictEvenWithDetailedOn() async {
+        let config = SDKHarness.reset()
+        CrashReportingPreference.set(false, in: CrashReporting.preferenceDefaults)
+        CrashReporting.setDetailedDiagnosticsEnabled(true)
+        CrashReporting.start(enabled: true, configuration: config)
+        #expect(SentrySDK.isEnabled)
+        #expect(CrashReporting.activeProfile == .strict)
+        #expect(CrashReportingPreference.lastProfile(in: CrashReporting.preferenceDefaults) == .strict)
+    }
+
     @MainActor @Test func strictSessionsUseAPerLaunchDistinctID() async throws {
         let config = SDKHarness.reset()
         ConsentSessionTracker.shared.isAppActive = { true }
@@ -59,6 +71,25 @@ extension SerialSuite {
             #expect(did != Self.plantedInstallationID)
             #expect(UUID(uuidString: did) != nil)
         }
+    }
+
+    // Review finding: consecutive strict launches share no session identifier.
+    @MainActor @Test func twoStrictLaunchesUseDifferentDistinctIDs() async throws {
+        var config = SDKHarness.reset()
+        let defaults = CrashReporting.preferenceDefaults
+        ConsentSessionTracker.shared.isAppActive = { true }
+        CrashReporting.start(enabled: true, configuration: config)            // strict launch 1
+        #expect(await SDKHarness.flush(until: { (try? Self.newSessionDistinctIDs().isEmpty == false) ?? false }))
+        let first = try Self.newSessionDistinctIDs()
+
+        config = SDKHarness.reset(keeping: defaults, copyingCacheFrom: config.cacheDirectory)
+        ConsentSessionTracker.shared.isAppActive = { true }
+        CrashReporting.start(enabled: true, configuration: config)            // strict launch 2
+        #expect(await SDKHarness.flush(until: { (try? Self.newSessionDistinctIDs().isEmpty == false) ?? false }))
+        let second = try Self.newSessionDistinctIDs()
+        #expect(first.count == 1)
+        #expect(second.count == 1)
+        #expect(first.isDisjoint(with: second))
     }
 
     @MainActor @Test func diagnosticSessionsAndEventsCarryTheInstallationID() async throws {
@@ -356,12 +387,23 @@ extension SerialSuite {
 
     // MARK: Consent-driven sessions
 
-    private static func lifecycleNames() -> (active: Notification.Name, resign: Notification.Name) {
+    private static func lifecycleNames()
+        -> (active: Notification.Name, resign: Notification.Name, terminate: Notification.Name) {
         #if os(macOS)
-        (NSApplication.didBecomeActiveNotification, NSApplication.willResignActiveNotification)
+        (NSApplication.didBecomeActiveNotification, NSApplication.willResignActiveNotification,
+         NSApplication.willTerminateNotification)
         #else
-        (UIApplication.didBecomeActiveNotification, UIApplication.willResignActiveNotification)
+        (UIApplication.didBecomeActiveNotification, UIApplication.willResignActiveNotification,
+         UIApplication.willTerminateNotification)
         #endif
+    }
+
+    private static func sessionUpdates() -> [[String: Any]] {
+        ((try? SDKHarness.envelopes()) ?? []).flatMap(\.items).filter { $0.type == "session" }.compactMap(\.json)
+    }
+
+    private static func hasSession(_ sid: String, status: String) -> Bool {
+        sessionUpdates().contains { $0["sid"] as? String == sid && $0["status"] as? String == status }
     }
 
     private static func sessionIDs() throws -> Set<String> {
@@ -381,7 +423,7 @@ extension SerialSuite {
         let consentedIDs = try Self.sessionIDs()
 
         CrashReporting.setEnabled(false)
-        let (active, resign) = Self.lifecycleNames()
+        let (active, resign, _) = Self.lifecycleNames()
         for _ in 0..<3 {                                   // background/foreground while off
             center.post(name: resign, object: nil)
             center.post(name: active, object: nil)
@@ -400,7 +442,9 @@ extension SerialSuite {
     }
 
     // Regression (review): a revocation racing an in-flight start must not leave a session
-    // open (or persisted for upload) while opted out.
+    // open (or persisted for upload) while opted out. The start runs on a background thread
+    // (lifecycle notifications may be posted on any thread); the revocation runs on main, as
+    // `setEnabled` requires, and must wait for the start to finish, then end that session.
     @MainActor @Test func revocationDuringPendingStartLeavesNoSessionOpen() async throws {
         let config = SDKHarness.reset()
         let center = NotificationCenter()
@@ -409,31 +453,35 @@ extension SerialSuite {
         CrashReporting.start(enabled: true, configuration: config)      // inactive: no session
         let entered = DispatchSemaphore(value: 0)
         let release = DispatchSemaphore(value: 0)
+        let posted = DispatchSemaphore(value: 0)
         ConsentSessionTracker.shared.beforeStartEffect = {
             entered.signal()
             release.wait()
         }
-        let (active, _) = Self.lifecycleNames()
-        let poster = Thread { center.post(name: active, object: nil) }   // start reserved, paused
-        poster.start()
-        await Task.detached { DispatchQueue.global().sync { _ = entered.wait(timeout: .now() + 5) } }.value
-        let revoker = Task.detached { CrashReporting.setEnabled(false) }  // blocks on the tracker lock
-        try await Task.sleep(nanoseconds: 100_000_000)
-        ConsentSessionTracker.shared.beforeStartEffect = nil
-        release.signal()
-        await revoker.value
+        let (active, _, _) = Self.lifecycleNames()
+        Thread { center.post(name: active, object: nil); posted.signal() }.start()   // start paused
+        #expect(entered.signalled(within: 5))          // start holds the tracker lock
+        // Released from another thread only while `setEnabled(false)` below is running on main.
+        let released = Locked(false)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) {
+            ConsentSessionTracker.shared.beforeStartEffect = nil
+            released.value = true
+            release.signal()
+        }
+        CrashReporting.setEnabled(false)                                 // blocks on the tracker lock
+        // It returned only after the paused start was released: the two overlapped and the
+        // revocation waited.
+        #expect(released.value)
+        #expect(posted.signalled(within: 5))
         // While opted out: gate closed and no session open locally.
         #expect(!ConsentGate.shared.isEnabled)
         #expect(!ConsentSessionTracker.shared.isSessionOpen)
         // Re-enable, then the paused-start session's final update (same sid) is `exited`.
         CrashReporting.setEnabled(true)
         #expect(await SDKHarness.flush(until: {
-            let items = (try? SDKHarness.envelopes().flatMap(\.items).filter { $0.type == "session" }
-                .compactMap(\.json)) ?? []
+            let items = Self.sessionUpdates()
             let sids = Set(items.compactMap { $0["sid"] as? String })
-            return sids.contains { sid in
-                items.contains { $0["sid"] as? String == sid && $0["status"] as? String == "exited" }
-            }
+            return sids.contains { Self.hasSession($0, status: "exited") }
         }))
     }
 
@@ -457,22 +505,96 @@ extension SerialSuite {
         }))
     }
 
-    @MainActor @Test func sessionFollowsAppActivityWhileConsented() async throws {
+    /// Starts the SDK (strict, consented) with an inactive app, a private notification center
+    /// and a controllable clock, then makes the app active; returns the open session's sid.
+    @MainActor private static func startWithActiveSession(
+        clock: Locked<Date>
+    ) async throws -> (sid: String, config: CrashReportingConfiguration) {
         let config = SDKHarness.reset()                    // resets the tracker seams first
         let center = NotificationCenter()
         ConsentSessionTracker.shared.notificationCenter = center
         ConsentSessionTracker.shared.isAppActive = { false }
+        ConsentSessionTracker.shared.now = { clock.value }
         CrashReporting.start(enabled: true, configuration: config)
         try await Task.sleep(nanoseconds: 300_000_000)
         #expect(!SDKHarness.delivered("session"))         // inactive app: no session yet
-        let (active, resign) = Self.lifecycleNames()
-        center.post(name: active, object: nil)
+        center.post(name: lifecycleNames().active, object: nil)
         #expect(await SDKHarness.flush(until: { SDKHarness.delivered("session") }))
-        center.post(name: resign, object: nil)             // ends it (status exited)
+        return (try #require(try sessionIDs().first), config)
+    }
+
+    private static func post(_ name: Notification.Name) {
+        ConsentSessionTracker.shared.notificationCenter.post(name: name, object: nil)
+    }
+
+    // Grace period (review finding): a short trip to the background keeps the session.
+    @MainActor @Test func shortBackgroundKeepsTheSession() async throws {
+        let clock = Locked(Date(timeIntervalSinceReferenceDate: 1_000))
+        let sid = try await Self.startWithActiveSession(clock: clock).sid
+        let (active, resign, _) = Self.lifecycleNames()
+        Self.post(resign)
+        clock.value += 29
+        Self.post(active)
+        #expect(ConsentSessionTracker.shared.isSessionOpen)
+        SentrySDK.capture(message: "flush barrier")        // something else to deliver
+        await SDKHarness.flush()
+        try await Task.sleep(nanoseconds: 300_000_000)
+        await SDKHarness.flush()
+        #expect(try Self.sessionIDs() == [sid])
+        #expect(!Self.hasSession(sid, status: "exited"))
+    }
+
+    @MainActor @Test func longBackgroundRotatesTheSession() async throws {
+        let clock = Locked(Date(timeIntervalSinceReferenceDate: 1_000))
+        let sid = try await Self.startWithActiveSession(clock: clock).sid
+        let (active, resign, _) = Self.lifecycleNames()
+        Self.post(resign)
+        #expect(ConsentSessionTracker.shared.isSessionOpen)  // not ended on resign
+        clock.value += 30
+        Self.post(active)
         #expect(await SDKHarness.flush(until: {
-            (try? SDKHarness.envelopes().flatMap(\.items).filter { $0.type == "session" }
-                .compactMap(\.json).contains { $0["status"] as? String == "exited" }) ?? false
+            Self.hasSession(sid, status: "exited") && ((try? Self.sessionIDs().count) ?? 0) == 2
         }))
+        #expect(ConsentSessionTracker.shared.isSessionOpen)
+    }
+
+    @MainActor @Test func terminateEndsTheSession() async throws {
+        let clock = Locked(Date(timeIntervalSinceReferenceDate: 1_000))
+        let sid = try await Self.startWithActiveSession(clock: clock).sid
+        Self.post(Self.lifecycleNames().terminate)
+        #expect(!ConsentSessionTracker.shared.isSessionOpen)
+        #expect(await SDKHarness.flush(until: { Self.hasSession(sid, status: "exited") }))
+    }
+
+    @MainActor @Test func optOutInTheGracePeriodEndsTheSessionImmediately() async throws {
+        let clock = Locked(Date(timeIntervalSinceReferenceDate: 1_000))
+        let sid = try await Self.startWithActiveSession(clock: clock).sid
+        Self.post(Self.lifecycleNames().resign)
+        CrashReporting.setEnabled(false)
+        #expect(!ConsentSessionTracker.shared.isSessionOpen)
+        Self.post(Self.lifecycleNames().active)              // back while off: nothing starts
+        #expect(!ConsentSessionTracker.shared.isSessionOpen)
+        RecordingURLProtocol.reset()
+        CrashReporting.setEnabled(true)                      // drains the queued final update
+        #expect(await SDKHarness.flush(until: { Self.hasSession(sid, status: "exited") }))
+    }
+
+    // A launch killed in the background: its session is closed as exited at the time it
+    // resigned active (like the SDK's tracker), not as abnormal.
+    @MainActor @Test func sessionOfALaunchKilledInTheBackgroundIsClosedAsExited() async throws {
+        let clock = Locked(Date())
+        let (sid, launch1) = try await Self.startWithActiveSession(clock: clock)
+        let defaults = CrashReporting.preferenceDefaults
+        let cache = launch1.cacheDirectory
+        Self.post(Self.lifecycleNames().resign)
+        // Killed: tear down without ending the session.
+        ConsentSessionTracker.shared.resetForTesting()
+        SentrySDK.close()
+        let config = SDKHarness.reset(keeping: defaults, copyingCacheFrom: cache)
+        ConsentSessionTracker.shared.isAppActive = { true }
+        CrashReporting.start(enabled: true, configuration: config)
+        #expect(await SDKHarness.flush(until: { Self.hasSession(sid, status: "exited") }))
+        #expect(!Self.hasSession(sid, status: "abnormal"))
     }
 
     // Regression (review): opting in starts a new stable ID, unlinked from the last strict launch.
@@ -569,24 +691,26 @@ extension SerialSuite {
     }
 
     // Regression (review): overlapping enable/disable calls end in the last call's state.
+    // `setEnabled` is main-thread-only, so the competing call comes from inside the running
+    // transition on main (an observer reacting synchronously): it must not run nested — it is
+    // queued and applied after the running transition completes.
     @MainActor @Test func overlappingEnableAndDisableEndDisabled() async throws {
         let config = SDKHarness.reset()
         CrashReporting.start(enabled: true, configuration: config)
         CrashReporting.setEnabled(false)
-        let paused = DispatchSemaphore(value: 0)
-        let resume = DispatchSemaphore(value: 0)
-        CrashReporting.afterConsentMarkerRemovedForTesting = {
-            paused.signal()
-            resume.wait()
+        var applied: [Bool] = []
+        var appliedWhenNestedCallReturned: [Bool]?
+        CrashReporting.afterTransitionForTesting = { applied.append($0) }
+        CrashReporting.beforeConsentMarkerRemovedForTesting = {
+            CrashReporting.beforeConsentMarkerRemovedForTesting = nil
+            CrashReporting.setEnabled(false)                     // competing call, mid-transition
+            appliedWhenNestedCallReturned = applied
         }
-        let enabling = Thread { CrashReporting.setEnabled(true) }
-        enabling.start()
-        await Task.detached { DispatchQueue.global().sync { _ = paused.wait(timeout: .now() + 5) } }.value
-        let disabling = Task.detached { CrashReporting.setEnabled(false) }   // must wait for enabling
-        try await Task.sleep(nanoseconds: 100_000_000)
-        CrashReporting.afterConsentMarkerRemovedForTesting = nil
-        resume.signal()
-        await disabling.value
+        CrashReporting.setEnabled(true)
+        // The nested call ran inside the enabling transition and returned before any
+        // transition completed; the disable ran only after the enable finished.
+        #expect(appliedWhenNestedCallReturned == [])
+        #expect(applied == [true, false])
         #expect(!CrashReportingPreference.isEnabled(in: CrashReporting.preferenceDefaults))
         #expect(!ConsentGate.shared.isEnabled)
         #expect(!ConsentSessionTracker.shared.isSessionOpen)
@@ -617,16 +741,19 @@ extension SerialSuite {
 
     // MARK: Trace consent
 
-    // Regression (review): a transaction started while consented, finished while opted out,
-    // and processed after re-enable is not delivered.
+    // Regression (review): a transaction started while consented that spans an opt-out is not
+    // delivered — even when it finishes after re-enable, with the gate open again, so only the
+    // trace-consent generation can drop it.
     @MainActor @Test func transactionSpanningAnOptOutIsNotDelivered() async throws {
         let config = SDKHarness.reset()
-        TraceConsent.shared.random = { 0 }
         CrashReporting.start(enabled: true, configuration: config)
-        let transaction = SentrySDK.startTransaction(name: "spanning", operation: "test")
+        let spanning = SentrySDK.startTransaction(name: "spanning", operation: "test")
+        let finishedWhileOff = SentrySDK.startTransaction(name: "finishedWhileOff", operation: "test")
         CrashReporting.setEnabled(false)
-        transaction.finish()
+        finishedWhileOff.finish()
         CrashReporting.setEnabled(true)
+        #expect(ConsentGate.shared.isEnabled)
+        spanning.finish()                    // gate open: dropped by TraceConsent alone
         let started = SentrySDK.startTransaction(name: "after", operation: "test")    // unbound
         let bound = SentrySDK.startTransaction(name: "bound", operation: "test", bindToScope: true)
         started.finish()                     // finishes while a different transaction is bound
@@ -640,10 +767,23 @@ extension SerialSuite {
     // Regression (review): tracing works right after a normal enabled launch.
     @MainActor @Test func transactionIsDeliveredAfterInitialStart() async throws {
         let config = SDKHarness.reset()
-        TraceConsent.shared.random = { 0 }
         CrashReporting.start(enabled: true, configuration: config)
         SentrySDK.startTransaction(name: "initial", operation: "test").finish()
         #expect(await SDKHarness.flush(until: { SDKHarness.delivered("transaction") }))
+    }
+
+    // Review finding: the sampler hands Sentry the configured rate (it rolls), so transactions
+    // carry the real `sample_rate`; 0 while opted out.
+    @MainActor @Test func samplerReturnsTheConfiguredRateWhileConsented() {
+        var configuration = SDKHarness.reset()
+        configuration.tracesSampleRate = 0.05
+        let options = Options()
+        CrashReporting.apply(configuration, to: options)
+        let context = SamplingContext(transactionContext: TransactionContext(name: "t", operation: "o"))
+        TraceConsent.shared.setConsented(true)
+        #expect(options.tracesSampler?(context)?.doubleValue == 0.05)
+        TraceConsent.shared.setConsented(false)
+        #expect(options.tracesSampler?(context)?.doubleValue == 0)
     }
 
     private static func transactionContext(_ name: String, trace: SentryId) -> TransactionContext {
@@ -655,7 +795,6 @@ extension SerialSuite {
     // Regression (review): transactions sharing a trace ID across a revocation are told apart.
     @MainActor @Test func sharedTraceIDDoesNotLetASpanningTransactionThrough() async throws {
         let config = SDKHarness.reset()
-        TraceConsent.shared.random = { 0 }
         CrashReporting.start(enabled: true, configuration: config)
         let trace = SentryId()
         let spanning = SentrySDK.startTransaction(transactionContext: Self.transactionContext("spanning", trace: trace))

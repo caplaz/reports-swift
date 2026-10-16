@@ -13,9 +13,10 @@ final class TraceConsent: @unchecked Sendable {
     /// transition (and `startSDK`), so the check and the admission are one atomic step against
     /// revocation.
     private var consented = false
+    /// Admitted identities, oldest first, at most `maxAdmitted`. The SDK rolls the sample
+    /// decision after admission, so unsampled transactions are admitted too; they never reach
+    /// `beforeSend` and age out of the cap.
     private var admitted: [String] = []
-    /// Test seam for the sampling roll.
-    var random: () -> Double = { Double.random(in: 0..<1) }
     /// Test seam: runs inside the lock after the consent check, before admission.
     var afterConsentCheckForTesting: (() -> Void)?
 
@@ -26,15 +27,16 @@ final class TraceConsent: @unchecked Sendable {
         "\(traceID.sentryIdString):\(spanID.sentrySpanIdString)"
     }
 
-    /// Called from `tracesSampler`. Returns the sample rate to apply (0 = not sampled).
+    /// Called from `tracesSampler`. While consented, admits `key` and returns `rate`, so the
+    /// SDK rolls the decision itself and reports the configured `sample_rate`; otherwise
+    /// returns 0 (never sampled).
     func admit(key: String, rate: Double) -> NSNumber {
-        guard random() < rate else { return 0 }
-        return lock.withLock {
+        lock.withLock {
             guard consented else { return 0 }
             afterConsentCheckForTesting?()
             admitted.append(key)
             if admitted.count > Self.maxAdmitted { admitted.removeFirst(admitted.count - Self.maxAdmitted) }
-            return 1
+            return NSNumber(value: rate)
         }
     }
 
@@ -71,7 +73,6 @@ final class TraceConsent: @unchecked Sendable {
 
     func resetForTesting() {
         setConsented(false)
-        random = { Double.random(in: 0..<1) }
         afterConsentCheckForTesting = nil
     }
 }
