@@ -174,6 +174,21 @@ transition can't race a revocation and leave a session open while opted out.
   (2026-10-16); an envelope test (force-quit relaunch → `abnormal` session with the first
   launch's `sid`) guards it, and any SPI change on a bump breaks the build.
 
+### 3.2d Consent transitions and tracing
+
+- `setEnabled` runs as one serialized transition (preference, consent marker, hang
+  tracking, gate, sessions, trace generation), so overlapping calls end in the last call's
+  state.
+- Tracing uses clock-free consent provenance: `tracesSampler` samples (at the configured
+  rate) only while consent is on and admits the trace ID to the current consent generation;
+  opting out clears the generation; `beforeSend` sends a transaction only if its trace ID is
+  still admitted. Transactions started while off, or spanning/finishing in an opted-out
+  interval, are never sent even if processed after re-enable.
+
+- Strict → diagnostic rotates `INSTALLATION` (fail closed) so the stable diagnostic ID is new and doesn't link the last strict session.
+
+- From the first opt-out of a process, app-hang tracking stays paused for the rest of that process and the scope carries `report.hangs=off` (never sent); `beforeSend` drops app-hang events carrying it, so a detection that overlapped the opted-out interval can't upload after re-enable.
+
 ### 3.3 Events from earlier launches — collection-time profile marker
 
 SentryCrash, app-hang and watchdog reports are written during launch N and sanitized when
