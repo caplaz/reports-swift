@@ -17,6 +17,17 @@ enum CrashReportSanitizer {
     /// any event carrying it. Deliberately **not** in `allowedTagKeys`: never sent.
     static let consentTagKey = "report.consent"
     static let consentOffValue = "off"
+    /// Scope tag set at the first opt-out of a process and never removed in it; marks hangs
+    /// whose detection could have overlapped the opted-out interval. Never sent (not in
+    /// `allowedTagKeys`).
+    static let hangsTagKey = "report.hangs"
+
+    /// sentry-cocoa marks app-hang events with mechanism type `AppHang`
+    /// (`SentryHangTrackingIntegration.swift:108`).
+    static func isAppHang(_ event: Event) -> Bool {
+        event.exceptions?.contains { $0.mechanism?.type == "AppHang" } ?? false
+    }
+
     static let allowedTagKeys: Set<String> = ["report.op", "report.error", profileTagKey]
     static let allowedContextKeys: [String: Set<String>] = [
         "os": ["name", "version", "build", "rooted"],

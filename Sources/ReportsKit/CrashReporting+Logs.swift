@@ -28,12 +28,15 @@ extension CrashReporting {
 
     /// Sends a structured log whose body is `"<operation> <describeError(error)>"` — never the
     /// error value, its description or `userInfo`. Attributes are `report.op`, `report.error`
-    /// (= `describeError(error)`) plus the SDK's non-identifying attributes.
+    /// (= `describeError(error)`) plus the SDK's non-identifying attributes. In the diagnostic
+    /// profile it also carries `report.error.detail` (`ErrorDetail.text(for:)`); the body and
+    /// throttle key do not change.
     ///
     /// Same no-op and throttling rules as `log(_:_:operation:)` with a message.
     public static func log(_ level: LogLevel, _ error: any Error, operation: Operation) {
         guard let configuration = canLog() else { return }
-        emit(makeLog(level, error: error, operation: operation, describe: configuration.describeError),
+        let detail = activeProfile == .diagnostic ? ErrorDetail.text(for: error) : nil
+        emit(makeLog(level, error: error, operation: operation, describe: configuration.describeError, detail: detail),
              level: level, operation: operation)
     }
 
@@ -48,17 +51,17 @@ extension CrashReporting {
     }
 
     static func makeLog(
-        _ level: LogLevel, error: any Error, operation: Operation, describe: (any Error) -> String
+        _ level: LogLevel, error: any Error, operation: Operation, describe: (any Error) -> String,
+        detail: String? = nil
     ) -> ExpectedLog {
         let description = describe(error)
-        return ExpectedLog(
-            level: level.sentryLevel,
-            body: "\(operation.rawValue) \(description)",
-            attributes: [
-                CrashReportSanitizer.logOperationKey: operation.rawValue,
-                CrashReportSanitizer.logErrorKey: description,
-                CrashReportSanitizer.logSourceKey: CrashReportSanitizer.logSource
-            ])
+        var attributes = [
+            CrashReportSanitizer.logOperationKey: operation.rawValue,
+            CrashReportSanitizer.logErrorKey: description,
+            CrashReportSanitizer.logSourceKey: CrashReportSanitizer.logSource
+        ]
+        if let detail { attributes[CrashReportSanitizer.logErrorDetailKey] = detail }
+        return ExpectedLog(level: level.sentryLevel, body: "\(operation.rawValue) \(description)", attributes: attributes)
     }
 
     private static func emit(_ log: ExpectedLog, level: LogLevel, operation: Operation) {

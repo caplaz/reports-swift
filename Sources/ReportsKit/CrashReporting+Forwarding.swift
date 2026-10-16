@@ -15,4 +15,7 @@ extension CrashReporting {
             }
         }
     }
+
+    /// Forwarded logs are emitted here, off the caller's thread (spec §6.2).
+    static let forwardQueue = DispatchQueue(label: "io.caplaz.ReportsKit.forwardLog", qos: .utility)
 }
