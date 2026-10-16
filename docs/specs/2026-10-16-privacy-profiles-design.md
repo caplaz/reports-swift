@@ -19,7 +19,7 @@ stable identifier.
 | 1 | Profiles | `ReportsKit` gains `CrashReporting.PrivacyProfile`: `.strict` (default, today's behavior + ID-free sessions) and `.diagnostic`. |
 | 2 | What `.diagnostic` adds | Raw error text and file names/paths (handled errors carry the error's own text; the sanitizer keeps exception values, frame file names and full image paths), **all** app logs at info and above forwarded to Sentry Logs with level + category, sessions with the installation ID (Crash Free Sessions + Crash Free Users), Sentry metrics enabled. Never: device/computer name, IP address, screenshots, view hierarchy. |
 | 3 | Strict sessions | Enabled, with a **per-launch random** `did` (verdict below: possible in sentry-cocoa 9.24.0 by deleting the SDK's `INSTALLATION` file before start). |
-| 4 | Selection | **User setting**, not environment. A second toggle "Share detailed diagnostics", shown in all builds, **off by default everywhere** (TestFlight included). `.diagnostic` only when "Send crash reports" **and** "Share detailed diagnostics" are both on at SDK start; otherwise `.strict`. Profile is fixed at SDK start (sentry-cocoa reads options once), so a change applies at next launch. No cached-environment mechanism. **No configuration override** (see §5.4). |
+| 4 | Selection | **User setting**, not environment. A second toggle "Share detailed diagnostics", shown in all builds, **off by default everywhere** (TestFlight included). `.diagnostic` only when "Send crash reports" **and** "Share detailed diagnostics" are both on at SDK start; otherwise `.strict`. Profile is chosen at SDK start (sentry-cocoa reads options once): turning detailed diagnostics **on** applies at the next SDK start; turning it **off** applies immediately in-process (callbacks and `forwardLog` use the more private of the started profile and the current setting; §3.4). No cached-environment mechanism. **No configuration override** (see §5.4). |
 | 5 | Logs | `PatternSpaceLog` returns a wrapper type with `os.Logger` call syntax; it writes to the unified log and, when a forwarder is installed, hands the rendered message + level + category to it. The app installs a forwarder that calls `CrashReporting.forwardLog(_:category:message:)` (diagnostic only, consent-gated, budgeted). Info and above only. |
 | 6 | Opt-out | "Send crash reports" off stops everything immediately in every profile (transport consent gate, session end, hang-tracking pause, `report.consent=off` scope marker so nothing collected while off is sent later). Reporting off at launch purges the cache; a failed purge stays pending and blocks the next SDK start until it succeeds. The detailed toggle is disabled (greyed) while reporting is off. |
 | 7 | Disclosures | Settings footers per toggle (4 locales + English), privacy.html, App Store privacy label (must change: optional collection is still collection), Help quickstart (5 locales), CHANGELOG. |
@@ -69,7 +69,8 @@ Paths relative to `reports-swift/.build/checkouts/sentry-cocoa/Sources` (9.24.0)
 before `SentrySDK.start` (main thread, first SDK call in the process). The SDK then
 generates a fresh random UUID for this launch and uses it as `did` for every session of
 the launch. Sessions are linkable within one launch only (on iOS a launch can have several
-foreground sessions), never across launches. Events and logs carry the same per-launch ID as
+foreground sessions); no identifier is shared across launches (timing could still correlate
+adjacent launches). Events and logs carry the same per-launch ID as
 `user.id`, which the strict sanitizer already strips (`SentryClient.m:979-992` via `:814`;
 `Swift/Tools/TelemetryScopeApplier/TelemetryScopeApplier.swift:128-146`).
 
@@ -106,7 +107,9 @@ Auto session tracking needs an active app: `SessionTracker.start` subscribes to
 
 ### 3.2 At SDK start (`start(enabled: true, …)` or `setEnabled(true)` starting the SDK)
 
-1. `requested = detailedDiagnostics ? .diagnostic : .strict` (start only runs with reporting on).
+1. `requested = storedReportingEnabled && detailedDiagnostics ? .diagnostic : .strict` — both
+   **stored** settings, so `start(enabled: true)` with the stored "Send crash reports" off is
+   strict whatever the detailed setting says.
 2. `previous = lastProfile ?? .strict`.
 3. Cache preparation, before `SentrySDK.start`:
    - a pending purge exists, **whatever `requested` is**, or `previous == .diagnostic &&
@@ -120,7 +123,8 @@ Auto session tracking needs an active app: `SessionTracker.start` subscribes to
    than the item already being absent, the SDK is not started, consent stays closed and
    `lastProfile` is not advanced; the pending flag makes the next start (next launch or
    `setEnabled(true)`) retry the full purge even if it requests `.diagnostic`.
-4. Write `lastProfile = requested`; set `activeProfile = requested`.
+4. Write `lastProfile = requested`; the started profile is `requested` (`activeProfile` is
+   the more private of it and the current detailed setting, §3.4).
 5. `SentrySDK.start` with options for `requested`; `Options.initialScope` sets scope tag
    `report.profile = requested` before any integration installs (§3.3).
 
@@ -134,9 +138,17 @@ has succeeded.
 `enableAutoSessionTracking = false` in both profiles. The SDK's SessionTracker would keep
 starting sessions on foreground while the user has opted out (only the transport is gated)
 and `captureSession` bypasses `beforeSend`, so those sessions would upload on re-enable.
-ReportsKit's `ConsentSessionTracker` opens a session exactly while consent is on and the app
-is active: on opt-out it ends the open session first (its final update covers only consented
-time), then closes the gate; nothing starts while off; re-enable starts a new session.
+ReportsKit's `ConsentSessionTracker` opens sessions only while consent is on, with the SDK
+tracker's grace period (`Swift/Integrations/Session/SessionTracker.swift:134-215`,
+`Options.sessionTrackingIntervalMillis`, 30 s): resigning active only records the time (and
+stores it in the SDK's `lastInForeground` file); becoming active again keeps the session after
+a shorter absence, or ends it and starts a new one after the interval or more (a clock that
+went backwards also rotates); terminating ends it. On opt-out it ends the open session at
+once, even inside the grace period (its final update covers only consented time), then closes
+the gate; nothing starts while off; re-enable starts a new session when the app is active. A
+rotated or terminated session ends at the current time (the hub's `endSession(withTimestamp:)`
+isn't reachable without the hub), so its duration includes the background time; the SDK's
+tracker ends it at the last foreground time.
 Crashed sessions are still closed by the SDK's crash integration from the stored session.
 State changes and the SDK's start/end-session calls run under one lock, so a lifecycle
 transition can't race a revocation and leave a session open while opted out.
@@ -144,7 +156,9 @@ transition can't race a revocation and leave a session open while opted out.
 ### 3.2c Consent marker and session recovery
 
 - Opt-out sets scope tag `report.consent = off` (before the gate closes) and pauses app-hang
-  tracking (`SentrySDK.pauseAppHangTracking`); re-enable removes the tag and resumes.
+  tracking (`SentrySDK.pauseAppHangTracking`); re-enable removes the consent tag, but hang
+  tracking stays paused for the rest of the process (and `report.hangs=off` stays on the
+  scope, §3.2d).
   `beforeSend` drops any event whose own tags carry `report.consent = off`. The marker is a
   collection-time fact that travels with stored data exactly like `report.profile` (§3.3) —
   synced into crash reports, applied to stored hangs at detection, persisted for watchdog
@@ -153,9 +167,11 @@ transition can't race a revocation and leave a session open while opted out.
   comparison is involved. The sanitizer never sends `report.consent` (not in the tag
   allowlist). An opted-out *launch* needs no marker: the SDK isn't running and the cache is
   purged (§3.2).
-- Manual session tracking still closes a previous launch's unfinished (force-quit, SIGKILL)
-  session as abnormal, once per process, only with consent, before the first session of the
-  launch. sentry-cocoa does this in `SessionTracker.endCachedSession` →
+- Manual session tracking still closes a previous launch's unfinished (killed in the
+  background, force-quit, SIGKILL) session, once per process, only with consent, before the
+  first session of the launch: as exited at the stored `lastInForeground` time when the
+  tracker recorded one (the app died in the background, as the hub does with a timestamp),
+  else as abnormal. sentry-cocoa does this in `SessionTracker.endCachedSession` →
   `-[SentryHub closeCachedSessionWithTimestamp:]` (`Swift/Integrations/Session/SessionTracker.swift:113-121`,
   `Sentry/SentryHub.m:197-229`), but `SentrySDK.currentHub()` is not in the 9.24.0 binary's
   public or SPI Swift interface (only `PrivateHeaders/SentrySDK+Private.h:61`, not exported by
@@ -166,8 +182,9 @@ transition can't race a revocation and leave a session open while opted out.
   (the crash integration already closed it; `Sentry/SentrySDKInternal.m:503-512`); build a
   `SentryFileManager(options: PrivateSentrySDKOnly.options, dateProvider:, dispatchQueueWrapper:)`
   from `SentryDependencyContainer.sharedInstance()` (same path and DSN hash as the client's,
-  `Sentry/SentryClient.m:69-73`); `readCurrentSession()`, `endAbnormal(withTimestamp: started)`,
-  `deleteCurrentSession()`; send it with `PrivateSentrySDKOnly.capture(SentryEnvelope(header:
+  `Sentry/SentryClient.m:69-73`); `readTimestampLastInForeground()` / `deleteTimestampLastInForeground()`,
+  `readCurrentSession()`, `endExited(withTimestamp: lastInForeground)` or
+  `endAbnormal(withTimestamp: started)`, `deleteCurrentSession()`; send it with `PrivateSentrySDKOnly.capture(SentryEnvelope(header:
   .empty(), singleItem: SentryEnvelopeItem(session:)))`, the envelope
   `-[SentryClient captureSession:]` builds (`Sentry/SentryClient.m:526-537`), through the
   gated transport. Type-checked against the macOS and iOS slices with `-warnings-as-errors`
@@ -176,14 +193,25 @@ transition can't race a revocation and leave a session open while opted out.
 
 ### 3.2d Consent transitions and tracing
 
-- `setEnabled` runs as one serialized transition (preference, consent marker, hang
-  tracking, gate, sessions, trace generation), so overlapping calls end in the last call's
-  state.
-- Tracing uses clock-free consent provenance: `tracesSampler` samples (at the configured
-  rate) only while consent is on and admits the trace ID to the current consent generation;
-  opting out clears the generation; `beforeSend` sends a transaction only if its trace ID is
-  still admitted. Transactions started while off, or spanning/finishing in an opted-out
-  interval, are never sent even if processed after re-enable.
+- `start`, `setEnabled` and `setDetailedDiagnosticsEnabled` are main-thread-only
+  (`dispatchPrecondition(condition: .onQueue(.main))`). `setEnabled` runs as one serialized
+  transition (preference, consent marker, hang tracking, gate, sessions, trace generation)
+  under `consentTransitionLock`, which is never held while waiting for main. A `setEnabled`
+  call made from inside a running transition (on main: a synchronous observer or callback) is
+  not run nested; it is queued and applied right after the running one, so overlapping calls
+  end in the last call's state. Lifecycle notifications may arrive on any thread; the session
+  tracker's own lock orders them against a revocation.
+- Tracing uses clock-free consent provenance: while consent is on, `tracesSampler` admits the
+  transaction's identity (trace ID + root span ID) to the current consent generation (bounded
+  to the 512 most recent) and returns the configured rate, so the SDK rolls the decision and
+  reports the real `sample_rate`; while off it returns 0. Opting out clears the generation;
+  `beforeSend` sends a transaction only if its identity is still admitted. Transactions
+  started while off, or spanning/finishing in an opted-out interval, are never sent even if
+  processed after re-enable. sentry-cocoa 9.24.0 skips `tracesSampler` only for a
+  transaction with an explicit `sampled` decision (`Sentry/SentrySampling.m`
+  `sentry_sampleTrace`); such a transaction is never admitted and is dropped (fail-safe; a
+  change from 0.2.2). A transaction continuing a trace with an inherited parent decision
+  still goes through `tracesSampler`, which overrides that decision.
 
 - Strict → diagnostic rotates `INSTALLATION` (fail closed) so the stable diagnostic ID is new and doesn't link the last strict session.
 
@@ -244,8 +272,20 @@ untagged events without the current scope, the way the SDK does).
 
 ### 3.4 Changes during a run
 
-- Detailed toggle: persisted only; the running SDK keeps its profile; UI footer says
-  "Takes effect the next time you open PatternSpace".
+- Detailed toggle **off** (owner decision, 2026-10-16 review): applies immediately. The
+  process is strict from then on, even if the toggle is turned back on: `beforeSend`,
+  `beforeBreadcrumb` and `beforeSendLog` sanitize with `mostPrivate(started, collected,
+  currentSetting)` (`user.id` stripped from events and logs, no error text/paths/breadcrumb
+  messages), `capture` and `log` stop adding `ErrorDetail` text, `forwardLog` (admission and
+  the queued emission) stops, metrics are dropped, and the scope's `report.profile` becomes
+  `strict` so crash/hang reports collected afterwards replay as strict. `activeProfile`
+  reports `.strict`. Not changeable in-process: release-health sessions keep the `did` they
+  started with (sentry-cocoa can't change it), and reports already queued (sanitized when
+  captured) are still delivered; the next start (strict, from a diagnostic `lastProfile`)
+  purges the cache anyway.
+- Detailed toggle **on**: persisted; applies at the next SDK start (next launch, or
+  `setEnabled(true)` starting the SDK after a launch with reporting off). The UI footer
+  "Takes effect the next time you open PatternSpace" is accurate for turning it on.
 - "Send crash reports" off: consent gate closes immediately (all profiles, all telemetry
   incl. sessions, forwarded logs and metrics — same transport). On again: same profile resumes.
 - Launched with reporting off, later turned on: the SDK starts then with the profile from
@@ -264,9 +304,11 @@ should make impossible. Tests drive the profile through `preferenceDefaults` ins
 ```swift
 extension CrashReporting {
     public enum PrivacyProfile: String, Sendable, CaseIterable { case strict, diagnostic }
-    /// The profile the running SDK started with; `.strict` when the SDK isn't running.
+    /// The profile the running SDK started with, downgraded to `.strict` once detailed
+    /// diagnostics is turned off in-process; `.strict` when the SDK isn't running.
     public static var activeProfile: PrivacyProfile { get }
-    /// Persists the "Share detailed diagnostics" choice; applies at the next SDK start.
+    /// Main thread only. Persists the "Share detailed diagnostics" choice; off applies
+    /// immediately, on at the next SDK start (§3.4).
     public static func setDetailedDiagnosticsEnabled(_ enabled: Bool)
 
     public enum ForwardedLogLevel: Sendable { case info, warning, error, fatal }
@@ -281,6 +323,7 @@ extension CrashReportingPreference {
 ```
 
 Unchanged signatures: `start`, `setEnabled`, `capture`, `log`, `CrashReportingConfiguration`.
+`start` and `setEnabled` now trap off the main thread (documented before for `start` only).
 Internal signatures gain a defaulted `profile:` parameter (`apply(_:profile:to:)`,
 `CrashReportSanitizer.sanitize(_:profile:)`, `sanitize(log:expected:environment:profile:)`)
 so existing tests compile unchanged and keep pinning strict behavior.
@@ -335,8 +378,8 @@ dedupe do not depend on the profile.
 
 ### 6.2 `CrashReporting.forwardLog`
 
-- No-op unless `activeProfile == .diagnostic` and `canLog()` (started, `logsEnabled`, gate
-  open, SDK enabled).
+- No-op unless `activeProfile == .diagnostic` (so also once detailed diagnostics is turned
+  off in-process) and `canLog()` (started, `logsEnabled`, gate open, SDK enabled).
 - Body = message truncated to 4,096 characters (+ "…").
 - Budget (`ForwardBudget`, injectable monotonic clock): identical `(level, category, body)`
   at most once per 10 s; at most 120 per rolling 60 s window; at most 5,000 per process.
@@ -456,7 +499,8 @@ Both platforms keep the "Privacy" section; a second section holds the new toggle
   item keeps its text with "Unless you turn on detailed diagnostics"; a new list item
   describes "Detailed diagnostics (optional, off by default)": error messages, file and
   folder names, the app's full activity log, a random installation identifier, release-health
-  sessions; sent the same way; turning it off discards unsent detailed data at next start.
+  sessions; sent the same way; turning it off stops detailed collection at once and discards
+  unsent detailed data at next start.
   No iOS wording. "Last updated" date bumped.
 - **App Store privacy label (macOS + iOS)** — must change, because optional collection that
   the user enables once (not per submission) does not meet Apple's "optional to disclose"
@@ -526,6 +570,17 @@ ReportsKit (`swift test --no-parallel -Xswiftc -warnings-as-errors`, Swift Testi
   with category/level/`user.id` in diagnostic; `forwardLog` sends nothing in strict; forwarded
   logs blocked on the wire after opt-out; existing strict suites unchanged except the session
   assertion in `noUserIdentifierAndNoSessionsAcrossStarts`, which moves to the new session tests.
+- Review fixes (2026-10-16): `start(enabled: true)` with stored reporting off and detailed on
+  is strict; two strict launches have disjoint session `did`s; session grace period (short
+  background keeps the session, ≥ interval rotates it, terminate ends it, opt-out in the grace
+  period ends it at once, a launch killed in the background is closed as exited); detailed
+  off in-process (scope tag, events incl. a replayed diagnostic-tagged one, breadcrumbs,
+  `user.id`, log detail, `forwardLog` admission and queued emission; on stays strict);
+  sampler returns the configured rate (0 while off); a transaction spanning an opt-out and
+  finished after re-enable is dropped by trace consent alone (gate open); the nested
+  `setEnabled` overlap is queued behind the running transition; the session revocation
+  overlap and the trace-admission revocation assert their semaphore waits (and that the
+  competing call was really blocked).
 
 PatternSpace:
 
