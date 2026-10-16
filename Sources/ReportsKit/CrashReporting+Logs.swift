@@ -76,12 +76,15 @@ extension CrashReporting {
     }
 }
 
-/// The log `CrashReporting.log` is emitting: the only shape `beforeSendLog` lets through.
+/// The log `CrashReporting` is emitting: the only shape `beforeSendLog` lets through.
 struct ExpectedLog: Equatable {
     let level: SentryLog.Level
     let body: String
     /// ReportsKit's own `report.*` attributes.
     let attributes: [String: String]
+    /// When the line was produced, if earlier than emission (forwarded logs are emitted on a
+    /// queue); replaces the SDK's timestamp.
+    var timestamp: Date? = nil
 }
 
 /// Thread-local slot holding the log being emitted on the current thread, so `beforeSendLog`
