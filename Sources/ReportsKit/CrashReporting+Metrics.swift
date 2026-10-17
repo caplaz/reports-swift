@@ -16,6 +16,20 @@ extension CrashReporting {
         record(metric, value: .counter(value), attributes: attributes)
     }
 
+    /// `Tally`'s emission: like `count`, but admitted only while `epoch` (the revocation epoch the
+    /// total was counted in) is current. A total from before an opt-out is never recorded, even
+    /// when its flush races the re-enable (metrics spec decision 9).
+    static func count(_ metric: Metric, _ value: UInt, attributes: [String: String], epoch: UInt64) {
+        guard metric.kind == .counter else { return kindMismatch(metric, .counter) }
+        record(metric, value: .counter(value), attributes: attributes, epoch: epoch)
+    }
+
+    /// The current revocation epoch while a metric may be recorded now, else `nil` (`Tally`).
+    static func metricEpoch() -> UInt64? {
+        guard canRecordMetric() else { return nil }
+        return metricRevocation.currentEpoch
+    }
+
     /// Records one value of a distribution, in the metric's unit. Same rules as `count`.
     public static func distribution(_ metric: Metric, _ value: Double, attributes: [String: String] = [:]) {
         guard metric.kind == .distribution else { return kindMismatch(metric, .distribution) }
@@ -84,8 +98,8 @@ extension CrashReporting {
     }
 
     /// Admission on the caller's thread; the SDK call on `metricQueue`.
-    static func record(_ metric: Metric, value: SentryMetricValue, attributes: [String: String]) {
-        guard canRecordMetric(), let timestamp = metricRevocation.admit(),
+    static func record(_ metric: Metric, value: SentryMetricValue, attributes: [String: String], epoch: UInt64? = nil) {
+        guard canRecordMetric(), let timestamp = metricRevocation.admit(epoch: epoch),
               let dropped = metricBudget.admit() else { return }
         let expected = ExpectedMetric(
             name: metric.name, value: value, unit: metric.sentryUnit,

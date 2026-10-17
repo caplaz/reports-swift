@@ -307,4 +307,48 @@ extension SerialSuite {
         #expect(CrashReporting.deleteMetricEnvelopes(in: cache))
         #expect(!FileManager.default.fileExists(atPath: metric))
     }
+
+    /// Review finding (tallies across consent changes), end to end.
+    @MainActor @Test func tallyTotalsFromBeforeAnOptOutAreNeverSent() async throws {
+        let config = SDKHarness.reset()
+        CrashReporting.start(enabled: true, configuration: config)
+        let tally = CrashReporting.Tally(.testCount, attributes: ["level": "critical"])
+        tally.add(3)
+        CrashReporting.setEnabled(false)
+        tally.add(5)                         // while off: rejected
+        CrashReporting.setEnabled(true)
+        tally.flush()                        // the 3 belong to the earlier epoch: discarded
+        tally.add(2)
+        tally.flush()                        // after the re-enable: sent
+        #expect(await Self.waitForMetrics(1))
+        await SDKHarness.flush()
+        let delivered = try Self.metricItems()
+        #expect(delivered.compactMap { $0["value"] as? Int } == [2])
+        #expect(delivered.compactMap { Self.metricStrings($0)["level"] } == ["critical"])
+    }
+
+    /// A flush that took its total before the opt-out and reaches admission only after the
+    /// re-enable: the emission carries the old epoch and is refused. The emit seam holds the
+    /// total, so the pause is deterministic.
+    @MainActor @Test func tallyEmissionCarriesItsEpochPastAnOptOut() async throws {
+        let config = SDKHarness.reset()
+        CrashReporting.start(enabled: true, configuration: config)
+        let held = Locked<[UInt64: UInt]>([:])
+        let tally = CrashReporting.Tally(
+            .testCount, attributes: ["level": "critical"], interval: 60,
+            now: { ProcessInfo.processInfo.systemUptime },
+            consent: { CrashReporting.metricEpoch() },
+            emit: { value, epoch in held.value[epoch] = value })
+        tally.add(4)
+        tally.flush()                        // total taken under the current epoch …
+        let (epoch, value) = try #require(held.value.first)
+        CrashReporting.setEnabled(false)
+        CrashReporting.setEnabled(true)
+        // … and emitted only now, through the production emission path.
+        CrashReporting.count(.testCount, value, attributes: ["level": "critical"], epoch: epoch)
+        CrashReporting.count(.testCount, attributes: ["level": "warning"])
+        #expect(await Self.waitForMetrics(1))
+        await SDKHarness.flush()
+        #expect(try Self.deliveredLevels() == ["warning"])
+    }
 }
