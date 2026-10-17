@@ -43,31 +43,32 @@ extension CrashReporting {
 
     /// Deletes every queued envelope holding a `trace_metric` item from each
     /// `io.sentry/<DSN hash>/envelopes/` under `cacheDirectory` (`SentryFileManagerHelper.m:14,145-192`).
-    /// Fails closed (spec §4.2 "Sweep"): `true` only when every envelope was inspected and every
-    /// metric envelope is gone.
+    /// Runs on the main thread in the toggle path, so metric-ness is decided from each file's
+    /// item header lines (`EnvelopeItems`), not a full deserialization. Fails closed (spec §4.2
+    /// "Sweep"): `true` only when every envelope was inspected and every metric envelope is gone.
     /// - Absent (`io.sentry`, a DSN directory without `envelopes`, a file deleted between listing
     ///   and reading): nothing to delete, success.
+    /// - Skipped, not inspected: dot-files and `.tmp` files (in-progress atomic writes; the
+    ///   cutoff and wire check still cover a metric batch renamed into place later) and
+    ///   subdirectories of `envelopes/` (the SDK only reads files there).
     /// - A listing or `isDirectory` error, or an envelope file that can't be read: failure. The
     ///   sweep can't tell what that file holds.
-    /// - A file the SDK can't deserialize is removed. The transport deletes such files unsent
-    ///   (`SentryHttpTransport.m:331-337`), and the SDK writes envelopes atomically
-    ///   (`SentryFileManagerHelper.m:592-599`), so nothing deliverable is lost.
+    /// - A file whose header lines can't be walked and that the SDK can't deserialize either is
+    ///   removed. The transport deletes such files unsent (`SentryHttpTransport.m:331-337`), and
+    ///   the SDK writes envelopes atomically (`SentryFileManagerHelper.m:592-599`), so nothing
+    ///   deliverable is lost.
     /// - A failed removal: failure (`remove` counts absence as success).
     /// The sweep keeps going after a failure, deleting what it can.
     static func deleteMetricEnvelopes(in cacheDirectory: URL) -> Bool {
         var complete = true
         let base = cacheDirectory.appendingPathComponent("io.sentry", isDirectory: true)
         for dsnDirectory in contents(of: base, complete: &complete) {
-            let isDirectory: Bool
-            do {
-                isDirectory = try dsnDirectory.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true
-            } catch {
-                complete = false
-                continue
-            }
-            guard isDirectory else { continue }
+            guard entryKind(dsnDirectory, complete: &complete) == .directory else { continue }
             let envelopes = dsnDirectory.appendingPathComponent("envelopes", isDirectory: true)
             for file in contents(of: envelopes, complete: &complete) {
+                let name = file.lastPathComponent
+                guard !name.hasPrefix("."), !name.hasSuffix(".tmp"),
+                      entryKind(file, complete: &complete) == .file else { continue }
                 let data: Data
                 do {
                     data = try readFile(file)
@@ -77,14 +78,35 @@ extension CrashReporting {
                     complete = false   // unreadable: it may hold a metric
                     continue
                 }
-                if let envelope = PrivateSentrySDKOnly.envelope(with: data),
-                   !envelope.items.contains(where: { $0.type() == SentryEnvelopeItemTypes.traceMetric }) {
-                    continue   // readable, holds no metric: kept
-                }
+                if !holdsMetricOrIsUnreadable(data) { continue }   // readable, holds no metric: kept
                 if !remove(file) { complete = false }
             }
         }
         return complete
+    }
+
+    private enum EntryKind { case file, directory, unknown }
+
+    /// A listed entry's kind. `.unknown` (skipped) when the `isDirectory` lookup fails: gone
+    /// since it was listed (success), or any other error, which sets `complete = false` since
+    /// the sweep can't tell what the entry holds.
+    private static func entryKind(_ url: URL, complete: inout Bool) -> EntryKind {
+        do {
+            return try url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true ? .directory : .file
+        } catch let error where isNoSuchFile(error) {
+            return .unknown
+        } catch {
+            complete = false
+            return .unknown
+        }
+    }
+
+    /// The sweep's decision for one envelope file: from its item header lines, or, when those
+    /// can't be walked, from the SDK's own deserializer (an envelope it can't read is removed).
+    static func holdsMetricOrIsUnreadable(_ data: Data) -> Bool {
+        if let items = EnvelopeItems(data) { return items.hasMetric }
+        guard let envelope = PrivateSentrySDKOnly.envelope(with: data) else { return true }
+        return envelope.items.contains { $0.type() == SentryEnvelopeItemTypes.traceMetric }
     }
 
     /// `directory`'s entries; `[]` when it doesn't exist; `[]` and `complete = false` on any

@@ -18,7 +18,7 @@ extension SerialSuite {
         return files
     }
 
-    private static func deliveredLevels() throws -> [String] {
+    static func deliveredLevels() throws -> [String] {
         try metricItems().compactMap { metricStrings($0)["level"] }
     }
 
@@ -306,6 +306,137 @@ extension SerialSuite {
         // Inspectable again: the sweep completes.
         #expect(CrashReporting.deleteMetricEnvelopes(in: cache))
         #expect(!FileManager.default.fileExists(atPath: metric))
+    }
+
+    /// Review finding: dot-files, `.tmp` files and subdirectories inside `envelopes/` are
+    /// skipped, not inspected, and don't fail the sweep.
+    @MainActor @Test func sweepSkipsTemporaryFilesAndSubdirectories() throws {
+        CrashReporting.resetFileSeamsForTesting()
+        let (cache, files) = try Self.sdkFiles()
+        defer { try? FileManager.default.removeItem(at: cache) }
+        defer { CrashReporting.resetFileSeamsForTesting() }
+        let metric = try #require(files.store(MetricRevocationTests.metricEnvelope(timestamp: Date())))
+        let envelopes = URL(fileURLWithPath: metric).deletingLastPathComponent()
+        let data = try Data(contentsOf: URL(fileURLWithPath: metric))
+        let dotFile = envelopes.appendingPathComponent(".dat.nosync1234.ABCD")
+        let tmpFile = envelopes.appendingPathComponent("write.tmp")
+        let subdirectory = envelopes.appendingPathComponent("nested", isDirectory: true)
+        try data.write(to: dotFile)
+        try data.write(to: tmpFile)
+        try FileManager.default.createDirectory(at: subdirectory, withIntermediateDirectories: true)
+        try data.write(to: subdirectory.appendingPathComponent("inner.json"))
+        // Reading any of the skipped entries would fail the sweep.
+        CrashReporting.readFile = { url in
+            if url.lastPathComponent == URL(fileURLWithPath: metric).lastPathComponent {
+                return try Data(contentsOf: url)
+            }
+            throw CocoaError(.fileReadNoPermission)
+        }
+        #expect(CrashReporting.deleteMetricEnvelopes(in: cache))
+        #expect(!FileManager.default.fileExists(atPath: metric))
+        #expect(FileManager.default.fileExists(atPath: dotFile.path))
+        #expect(FileManager.default.fileExists(atPath: tmpFile.path))
+        #expect(FileManager.default.fileExists(atPath: subdirectory.path))
+    }
+
+    /// The sweep decides from item header lines; a file they can't be walked in falls back to
+    /// the SDK's deserializer (unreadable by both: removed, as before).
+    @Test func sweepDecisionFromItemHeaders() throws {
+        let metric = try #require(MetricRevocation.gunzip(MetricRevocationTests.body(
+            MetricRevocationTests.metricEnvelope(timestamp: Date()))))
+        let event = try #require(MetricRevocation.gunzip(MetricRevocationTests.body(MetricRevocationTests.eventEnvelope())))
+        #expect(CrashReporting.holdsMetricOrIsUnreadable(metric))
+        #expect(!CrashReporting.holdsMetricOrIsUnreadable(event))
+        #expect(CrashReporting.holdsMetricOrIsUnreadable(Data("not an envelope".utf8)))
+    }
+
+    /// Review finding (isolate the forced flush): with the wire check off, a metric that passed
+    /// `beforeSendMetric` before the opt-out is still not delivered after the re-enable — the
+    /// opt-out's flush hands its batch to the transport (refused by the closed gate, so it is
+    /// written to disk) and the sweep deletes it.
+    @MainActor @Test func forcedFlushAndSweepAloneDropAPreCutoffMetric() async throws {
+        let config = SDKHarness.reset()
+        MetricRevocation.wireCheckEnabledForTesting = false
+        CrashReporting.start(enabled: true, configuration: config)
+        CrashReporting.count(.testCount, attributes: ["level": "warning"])
+        CrashReporting.metricQueue.sync {}   // passed beforeSendMetric: in the SDK's 5 s buffer
+        CrashReporting.setEnabled(false)
+        CrashReporting.setEnabled(true)
+        CrashReporting.count(.testCount, attributes: ["level": "critical"])
+        #expect(await Self.waitForMetrics(1))
+        #expect(await SDKHarness.flush(until: {
+            Self.envelopeFiles(in: config.cacheDirectory, containing: "trace_metric").isEmpty
+        }))
+        #expect(try Self.deliveredLevels() == ["critical"])
+    }
+
+    /// Review finding (stress): recording on several threads while consent is toggled; no
+    /// metric admitted before the last opt-out is delivered.
+    /// Offline while toggling, so no batch is legitimately delivered between the toggles (a
+    /// metric sent while reporting was on may be pre-cutoff by a later opt-out).
+    @MainActor @Test func concurrentRecordingAndRevocationDeliverNoPreCutoffMetric() async throws {
+        let config = SDKHarness.reset(mode: .failConnection)
+        CrashReporting.start(enabled: true, configuration: config)
+        CrashReporting.metricBudget = MetricBudget(perMinute: .max, perProcess: .max)
+        let stop = Locked(false)
+        let recorders = (0..<4).map { _ in
+            Thread {
+                while !stop.value {
+                    CrashReporting.count(.testCount, attributes: ["level": "warning"])
+                    usleep(1_000)
+                }
+            }
+        }
+        recorders.forEach { $0.start() }
+        for _ in 0..<3 {
+            try await Task.sleep(for: .milliseconds(30))
+            CrashReporting.setEnabled(false)
+            try await Task.sleep(for: .milliseconds(10))
+            CrashReporting.setEnabled(true)
+        }
+        CrashReporting.setEnabled(false)   // last opt-out while recorders still run
+        stop.value = true
+        while recorders.contains(where: { !$0.isFinished }) { try await Task.sleep(for: .milliseconds(5)) }
+        CrashReporting.metricQueue.sync {}
+        RecordingURLProtocol.mode = .accept
+        CrashReporting.setEnabled(true)
+        CrashReporting.count(.testCount, attributes: ["level": "critical"])
+        #expect(await SDKHarness.flush(until: {
+            ((try? Self.deliveredLevels()) ?? []).contains("critical")
+                && Self.envelopeFiles(in: config.cacheDirectory, containing: "trace_metric").isEmpty
+        }, seconds: 10))
+        let delivered = try Self.metricItems()
+        #expect(!delivered.isEmpty)
+        let revoked = delivered.filter { item in
+            guard let seconds = item["timestamp"] as? Double else { return true }
+            return CrashReporting.metricRevocation.isRevoked(seconds: seconds)
+        }
+        #expect(revoked.isEmpty, "\(revoked.count) of \(delivered.count) delivered metrics predate the opt-out")
+        #expect(delivered.compactMap { Self.metricStrings($0)["level"] }.filter { $0 == "warning" }.isEmpty)
+    }
+
+    /// Review finding (Tally hot path): metric admission uses ReportsKit's cached started
+    /// state, not `SentrySDK.isEnabled`; the emission still checks the SDK, so a metric admitted
+    /// after the SDK was closed behind ReportsKit's back is dropped.
+    @MainActor @Test func metricAdmissionUsesCachedStartedState() async throws {
+        let config = SDKHarness.reset()
+        #expect(!CrashReporting.canRecordMetric())                       // before start
+        CrashReporting.start(enabled: true, configuration: config)
+        #expect(CrashReporting.canRecordMetric())
+        CrashReporting.setEnabled(false)
+        #expect(!CrashReporting.canRecordMetric())                       // consent off
+        CrashReporting.setEnabled(true)
+        #expect(CrashReporting.canRecordMetric())
+        SentrySDK.close()                                                // not through ReportsKit
+        #expect(CrashReporting.canRecordMetric())                        // cached: still admits …
+        CrashReporting.count(.testCount, attributes: ["level": "warning"])
+        CrashReporting.metricQueue.sync {}
+        await SDKHarness.flush()
+        #expect(!SDKHarness.delivered("trace_metric"))                   // … but nothing is emitted
+        CrashReporting.start(enabled: false, configuration: config)      // a launch without a running SDK
+        #expect(!CrashReporting.canRecordMetric())
+        _ = SDKHarness.reset()
+        #expect(!CrashReporting.canRecordMetric())                       // resetForTesting
     }
 
     /// Review finding (tallies across consent changes), end to end.

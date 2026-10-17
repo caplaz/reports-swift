@@ -212,7 +212,7 @@ let start = ContinuousClock.now
 CrashReporting.duration(.exportDuration, since: start, attributes: ["format": "cube"], outcome: "success")
 try await CrashReporting.measure(.exportDuration, attributes: ["format": "3dl"]) { try await export() }
 
-let late = CrashReporting.Tally(.framesLate)   // hot paths: lock-only adds, ≤ 1 count per minute
+let late = CrashReporting.Tally(.framesLate)   // hot paths: no SDK call per add, ≤ 1 count per minute
 late.add()
 late.flush()                                    // when the activity ends
 ```
@@ -222,18 +222,30 @@ performance data). Names, keys and values are static identifiers (`[a-z0-9_.]` n
 `[A-Za-z0-9_.-]` values, ≤ 4 keys); a value not declared for its key is sent as `other`, an
 undeclared key is dropped. Each metric carries only those attributes plus `sentry.release`,
 `sentry.environment`, `sentry.sdk.*`, `os.name/version`, `device.brand/model/family` — never
-`user.id` or any other identifier; in `strict` each metric also gets a fresh random trace ID.
+`user.id` or any other identifier; in `strict` each metric also gets a fresh random trace ID,
+so it can't be linked to events or transactions through its trace (metrics sent in one SDK
+batch still share an envelope). In `diagnostic` metrics keep the SDK's per-process
+propagation trace ID, which they share with that process's events — and those carry the
+installation ID as `user.id` — so diagnostic metrics can be linked to identified events.
 Calls are safe from any thread, budgeted (60 per minute, 3,000 per process; overflow is
-reported as `reportskit.metrics.dropped`) and batched by the SDK (sent within ~5 s). Metrics
+reported as `reportskit.metrics.dropped`) and batched by the SDK (sent within ~5 s). The
+dropped-count metric is sent with the next admitted metric and doesn't count against the
+budget; once the per-process cap is reached nothing more is admitted, so metrics dropped
+after that are not reported. `Tally.add` makes no SDK call: it takes a few short ReportsKit
+locks (started state, consent gate, revocation epoch, the tally's own) and records at most
+one count per interval. Metrics
 the app sends directly through `SentrySDK.metrics` are dropped. `metricsEnabled: false` in the
 configuration turns them off.
 
 Turning reporting off deletes the metrics recorded before it that haven't been sent yet. They
-are never delivered, also not if reporting is turned back on in the same process. Queued
-crash reports, errors and logs keep the existing rule. Toggling "Send crash reports" briefly
-blocks the main thread (at most about a second) while ReportsKit flushes the SDK's metric
-buffer, with uploads blocked, and deletes the metric envelopes. A `Tally` counts only while
-reporting is on, and a total still pending at an opt-out is discarded, never sent.
+are not delivered once the opt-out completes (a batch already in flight when the gate cancels
+it may have reached the server), also not if reporting is turned back on in the same process.
+Queued crash reports, errors and logs keep the existing rule. Toggling "Send crash reports"
+briefly blocks the main thread: turning it off flushes the SDK's metric buffer (at most about
+a second, with uploads blocked) and, like turning it on, sweeps the SDK's envelope directory —
+listing it and reading each queued envelope's item headers to delete the metric ones, so the
+cost grows with the number of queued envelopes. A `Tally` counts only while reporting is on,
+and a total still pending at an opt-out is discarded, never sent.
 
 ## Privacy guarantees
 
@@ -248,7 +260,7 @@ reporting is on, and a total still pending at an opt-out is discarded, never sen
 | Installation ID | stripped everywhere | `user.id` on events and logs |
 | Sessions | yes, random ID per launch | yes, installation ID |
 | Paths and error text may contain the account name (`/Users/<name>/`) | no | yes |
-| Metrics (declared via `CrashReporting.Metric`) | yes — declared attributes + non-identifying SDK attributes, random trace ID per metric, no `user.id` | same, trace/span IDs kept, still no `user.id` |
+| Metrics (declared via `CrashReporting.Metric`) | yes — declared attributes + non-identifying SDK attributes, random trace ID per metric, no `user.id` | same, trace/span IDs kept (the propagation trace ID is shared with identified events), still no `user.id` |
 | Device name, IP, screenshots, view hierarchy | never | never |
 
 The profile is chosen at SDK start: `diagnostic` only when both stored settings,

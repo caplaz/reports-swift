@@ -80,11 +80,71 @@ import Testing
             contentType: "application/vnd.sentry.items.trace-metric+json", itemCount: 1)
         let brokenBody = try Self.body(SentryEnvelope(header: SentryEnvelopeHeader.empty(), singleItem: broken))
         #expect(revocation.verdict(forRequestBody: brokenBody) == .swallow)
-        // A gzip stream with optional header fields (never produced by the SDK) can't be read:
-        // refused, neither forwarded nor swallowed.
-        var unreadable = newBody
-        unreadable[unreadable.startIndex + 3] = 0x08   // FNAME flag
-        #expect(revocation.verdict(forRequestBody: unreadable) == .refuse)
+        // A gzip stream with optional header fields (never produced by the SDK) is still read.
+        #expect(revocation.verdict(forRequestBody: Self.withFileName(oldBody)) == .swallow)
+        #expect(revocation.verdict(forRequestBody: Self.withFileName(newBody)) == .forward)
+    }
+
+    /// `body` with an FNAME field in its gzip header (RFC 1952 §2.3.1).
+    static func withFileName(_ body: Data) -> Data {
+        var header = Data(body.prefix(10))
+        header[header.startIndex + 3] |= 0x08
+        return header + Data("envelope.json\0".utf8) + body.dropFirst(10)
+    }
+
+    /// Review finding: an unreadable body is refused (kept on disk) only when a metric item may
+    /// be in it; any other unreadable body takes the normal gate path, so it can't block the
+    /// upload queue for the rest of the process.
+    @Test func unreadableBodiesAreRefusedOnlyWhenTheyMayHoldAMetric() throws {
+        let revocation = MetricRevocation()
+        _ = try #require(revocation.admit())
+        revocation.revoke()
+        revocation.reopen()
+        // A gzip stream that can't be inflated (corrupt DEFLATE data): no readable metric.
+        var corrupt = try Self.body(Self.eventEnvelope())
+        for index in (corrupt.startIndex + 10)..<(corrupt.startIndex + 16) { corrupt[index] = 0xFF }
+        #expect(MetricRevocation.gunzip(corrupt) == nil)
+        #expect(revocation.verdict(forRequestBody: corrupt) == .forward)
+        // Plain bodies whose item headers can't be walked.
+        let brokenEvent = Data("{}\n{\"type\":\"event\",\"length\":999}\n{}".utf8)
+        #expect(revocation.verdict(forRequestBody: brokenEvent) == .forward)
+        let brokenMetric = Data("{}\n{\"type\":\"trace_metric\",\"length\":999}\n{}".utf8)
+        #expect(revocation.verdict(forRequestBody: brokenMetric) == .refuse)
+        let garbledHeader = Data("{}\nnot json, but trace_metric\n{}".utf8)
+        #expect(revocation.verdict(forRequestBody: garbledHeader) == .refuse)
+        #expect(revocation.verdict(forRequestBody: Data("no envelope header".utf8)) == .forward)
+    }
+
+    /// Envelope items are found from their header lines alone (spec §4.2).
+    @Test func envelopeItemsAreReadFromTheirHeaderLines() throws {
+        let metric = try #require(MetricRevocation.gunzip(Self.body(Self.metricEnvelope(timestamp: Date()))))
+        let items = try #require(EnvelopeItems(metric))
+        #expect(items.hasMetric)
+        #expect(items.metricPayloads.count == 1)
+        let payload = try #require(items.metricPayloads.first)
+        #expect((try JSONSerialization.jsonObject(with: payload) as? [String: Any])?["items"] != nil)
+
+        let event = try #require(MetricRevocation.gunzip(Self.body(Self.eventEnvelope())))
+        let eventItems = try #require(EnvelopeItems(event))
+        #expect(!eventItems.hasMetric)
+        #expect(eventItems.metricPayloads.isEmpty)
+
+        // A payload containing newlines and the type name is skipped by length, then the next
+        // item (a metric without explicit length: runs to the next newline) is found.
+        let tricky = "{\"type\":\"trace_metric\"}\n"
+        let mixed = Data(("{}\n{\"type\":\"attachment\",\"length\":\(tricky.utf8.count)}\n" + tricky
+            + "\n{\"type\":\"trace_metric\"}\n{\"items\":[]}\n").utf8)
+        let mixedItems = try #require(EnvelopeItems(mixed))
+        #expect(mixedItems.hasMetric)
+        #expect(mixedItems.metricPayloads == [Data(#"{"items":[]}"#.utf8)])
+        let attachmentOnly = Data(("{}\n{\"type\":\"attachment\",\"length\":\(tricky.utf8.count)}\n" + tricky).utf8)
+        #expect(EnvelopeItems(attachmentOnly)?.hasMetric == false)
+
+        #expect(EnvelopeItems(Data("{}".utf8)) == nil)                                    // no header line
+        #expect(EnvelopeItems(Data("{}\n{\"length\":2}\n{}".utf8)) == nil)                  // no type
+        #expect(EnvelopeItems(Data("{}\n{\"type\":\"event\",\"length\":50}\n{}".utf8)) == nil)   // past the end
+        #expect(EnvelopeItems.mayHoldMetric(Data("x trace_metric y".utf8)))
+        #expect(!EnvelopeItems.mayHoldMetric(Data("{\"type\":\"event\"}".utf8)))
     }
 
     @Test func everyRevokeStartsANewEpochAndOldEpochsAreNotAdmitted() throws {

@@ -2,7 +2,8 @@ import Foundation
 
 extension CrashReporting {
     /// Adds up a high-frequency counter (e.g. per-frame events) without SDK work on the hot
-    /// path: `add` only takes uncontended locks (the consent check's and its own). The first
+    /// path: `add` makes no SDK call and takes only short ReportsKit locks (the started state
+    /// and configuration, the consent gate, the revocation epoch and its own). The first
     /// `add` at least `interval` after the window opened records the sum with
     /// `CrashReporting.count`, and `flush` records whatever is pending (call it when the
     /// activity ends). Counter metrics only. Safe from any thread.

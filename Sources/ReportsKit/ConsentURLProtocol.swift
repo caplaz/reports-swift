@@ -90,7 +90,8 @@ final class ConsentURLProtocol: URLProtocol, @unchecked Sendable {
         decision: for _ in 0..<Self.maxDecisions {
             // Metrics admitted before an opt-out are never delivered (metrics spec §4.2): answer
             // a pre-cutoff metric batch with 200 so sentry-cocoa deletes it unsent
-            // (`SentryHttpTransport.m:433-447`); refuse a body that can't be read (kept on disk).
+            // (`SentryHttpTransport.m:433-447`); refuse an unreadable body that may hold a
+            // metric (kept on disk). An unreadable body without one takes the normal gate path.
             let revocation = CrashReporting.metricRevocation
             let checked = revocation.checkedVerdict(forRequestBody: body)
             Self.afterVerdictForTesting?(body, checked.verdict)

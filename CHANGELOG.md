@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0-beta.2 — 2026-10-17
+## 0.3.0-beta.2 — 2026-10-16
 
 ### Added
 
@@ -10,9 +10,9 @@
 
 - `enableMetrics` follows `metricsEnabled` in both profiles (was diagnostic-only with no producer).
 - `Options.maxCacheItems` is 100 (was the SDK default 30) so offline metric batches can't evict queued reports.
-- Opt-out deletes metrics still pending (SDK buffer, transport, disk) so they are never delivered, also after an in-process re-enable: revocation cutoff on ReportsKit-issued timestamps, forced buffer flush, envelope sweeps at opt-out, at re-enable (fails closed) and at the next start, and a wire check in `ConsentURLProtocol` that answers pre-cutoff metric batches with 200 without sending them (bound to the revocation epoch and re-checked atomically with gate admission). Sweeps fail closed on listing and read errors too. `Tally` ignores adds while reporting is off and discards totals pending at an opt-out.
+- Opt-out deletes metrics still pending (SDK buffer, transport, disk) so they are never delivered, also after an in-process re-enable: revocation cutoff on ReportsKit-issued timestamps, forced buffer flush, envelope sweeps at opt-out, at re-enable (fails closed) and at the next start, and a wire check in `ConsentURLProtocol` that answers pre-cutoff metric batches with 200 without sending them (bound to the revocation epoch and re-checked atomically with gate admission). Metric-ness is decided from the envelope's item header lines (only metric payloads are parsed); an unreadable upload is refused only when it may hold a metric item, so one unreadable non-metric envelope can't block the upload queue. Sweeps fail closed on listing and read errors too, and skip dot-files, `.tmp` files and subdirectories of `envelopes/`. `Tally` ignores adds while reporting is off and discards totals pending at an opt-out; its `add` makes no SDK call (the SDK-started state is cached under ReportsKit's lock).
 
-## 0.3.0 — 2026-10-16
+## 0.3.0-beta.1 — 2026-10-16
 
 ### Added
 

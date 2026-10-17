@@ -248,11 +248,15 @@ public enum CrashReporting {
         return configuration
     }
 
-    /// Whether a metric may be recorded now: started, `metricsEnabled`, consent on, SDK running.
+    /// Whether a metric may be recorded now: started, `metricsEnabled`, consent on, SDK started
+    /// by ReportsKit. The hot path of `count` and `Tally.add`, so it takes only ReportsKit's own
+    /// locks: `sdkStarted` (set after `SentrySDK.start`, cleared by `start` when no SDK is
+    /// running, by a failed `startSDK` and by `resetForTesting`) stands in for
+    /// `SentrySDK.isEnabled`, which takes the SDK's global lock. The emission on `metricQueue`
+    /// still checks `SentrySDK.isEnabled`, so a metric admitted after the app closed the SDK
+    /// itself is dropped there.
     static func canRecordMetric() -> Bool {
-        guard let configuration = lock.withLock({ Self.configuration }), configuration.metricsEnabled,
-              ConsentGate.shared.isEnabled, SentrySDK.isEnabled else { return false }
-        return true
+        lock.withLock { sdkStarted && configuration?.metricsEnabled == true } && ConsentGate.shared.isEnabled
     }
 
     static func makeEvent(
@@ -550,6 +554,7 @@ public enum CrashReporting {
         forwardBudget = ForwardBudget()
         metricBudget = MetricBudget()
         metricRevocation = MetricRevocation()
+        MetricRevocation.wireCheckEnabledForTesting = true
         ConsentURLProtocol.afterVerdictForTesting = nil
     }
 }

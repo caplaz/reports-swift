@@ -197,8 +197,11 @@ enum CrashReportSanitizer {
     /// Keeps only the metric ReportsKit is emitting on this thread right now (`expected`, same
     /// name, value and unit); rebuilds its attributes from the SDK allowlist plus the
     /// declaration-filtered app attributes; sets the admission timestamp. Strict replaces the
-    /// process-wide propagation `traceId` with a fresh random one and removes `spanId`, so no
-    /// two metrics can be linked (spec §4). Returns `nil` (drop) for anything else.
+    /// process-wide propagation `traceId` with a fresh random one and removes `spanId`, so a
+    /// metric can't be linked to events or transactions through its trace (spec §4); metrics
+    /// in one SDK batch still share an envelope. Diagnostic keeps both IDs: its metrics share
+    /// the propagation trace ID with events that carry `user.id`. Returns `nil` (drop) for
+    /// anything else.
     static func sanitize(
         metric: SentryMetric, expected: ExpectedMetric?, environment: String? = nil, profile: Profile = .strict
     ) -> SentryMetric? {
