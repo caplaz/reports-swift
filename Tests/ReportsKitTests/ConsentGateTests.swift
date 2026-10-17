@@ -35,4 +35,31 @@ import Testing
         #expect(gate.admittedCount == 0)
         #expect(gate.admit { makeTask() } == nil)
     }
+
+    @Test func conditionalAdmissionChecksValidityUnderTheGateLock() {
+        let gate = ConsentGate()
+        var checked = false
+        // Closed is decided first; validity isn't even evaluated.
+        guard case .closed = gate.admit(while: { checked = true; return true }, { makeTask() }) else {
+            Issue.record("expected .closed")
+            return
+        }
+        #expect(!checked)
+        gate.setEnabled(true)
+        var built = false
+        guard case .stale = gate.admit(while: { false }, { built = true; return makeTask() }) else {
+            Issue.record("expected .stale")
+            return
+        }
+        #expect(!built)
+        #expect(gate.admittedCount == 0)
+        guard case .admitted(let task) = gate.admit(while: { true }, { makeTask() }) else {
+            Issue.record("expected .admitted")
+            return
+        }
+        #expect(gate.admittedCount == 1)
+        gate.setEnabled(false)                              // admitted tasks are revoked as before
+        #expect(task.state == .canceling || task.state == .completed)
+        #expect(gate.admittedCount == 0)
+    }
 }

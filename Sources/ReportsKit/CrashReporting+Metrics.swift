@@ -85,10 +85,11 @@ extension CrashReporting {
 
     /// Admission on the caller's thread; the SDK call on `metricQueue`.
     static func record(_ metric: Metric, value: SentryMetricValue, attributes: [String: String]) {
-        guard canRecordMetric(), let dropped = metricBudget.admit() else { return }
+        guard canRecordMetric(), let timestamp = metricRevocation.admit(),
+              let dropped = metricBudget.admit() else { return }
         let expected = ExpectedMetric(
             name: metric.name, value: value, unit: metric.sentryUnit,
-            attributes: metric.filtered(attributes), timestamp: Date())
+            attributes: metric.filtered(attributes), timestamp: timestamp)
         metricQueue.async {
             emit(expected)
             if dropped > 0 {
@@ -100,8 +101,8 @@ extension CrashReporting {
     }
 
     private static func emit(_ metric: ExpectedMetric) {
-        // Consent may have been turned off since admission (metrics spec §4.1).
-        guard ConsentGate.shared.isEnabled, SentrySDK.isEnabled else { return }
+        // Consent may have been turned off (or off and on again) since admission (spec §4.1, §4.2).
+        guard ConsentGate.shared.isEnabled, SentrySDK.isEnabled, !metricRevocation.isRevoked(metric.timestamp) else { return }
         let attributes = metric.attributes.mapValues { $0 as any SentryAttributeValue }
         // beforeSendMetric runs synchronously on this thread and matches the pending metric.
         PendingMetric.with(metric) {

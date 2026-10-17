@@ -18,6 +18,8 @@ extension SerialSuite {
 
     @Test func consentProtocolForwardsBodyWhileEnabled() async throws {
         RecordingURLProtocol.reset()
+        CrashReporting.metricRevocation = MetricRevocation()   // no cutoff from an earlier test
+        ConsentURLProtocol.afterVerdictForTesting = nil
         RecordingURLProtocol.installBehindConsentProtocol()
         ConsentGate.shared.setEnabled(true)
         let (_, response) = try await outerSession().data(for: envelopeRequest())
@@ -27,6 +29,8 @@ extension SerialSuite {
 
     @Test func consentProtocolFailsWithoutResponseWhileDisabled() async {
         RecordingURLProtocol.reset()
+        CrashReporting.metricRevocation = MetricRevocation()   // no cutoff from an earlier test
+        ConsentURLProtocol.afterVerdictForTesting = nil
         RecordingURLProtocol.installBehindConsentProtocol()
         ConsentGate.shared.setEnabled(false)
         await #expect(throws: URLError.self) {
@@ -37,6 +41,8 @@ extension SerialSuite {
 
     @Test func bodyStreamReadErrorFailsWithNoResponse() async {
         RecordingURLProtocol.reset()
+        CrashReporting.metricRevocation = MetricRevocation()   // no cutoff from an earlier test
+        ConsentURLProtocol.afterVerdictForTesting = nil
         RecordingURLProtocol.installBehindConsentProtocol()
         ConsentGate.shared.setEnabled(true)
         var request = URLRequest(url: URL(string: "https://reports.example.invalid/api/7/envelope/")!)
@@ -51,6 +57,8 @@ extension SerialSuite {
 
     @Test func optOutAfterAdmissionCancelsBeforeAnyByteIsDelivered() async throws {
         RecordingURLProtocol.reset(mode: .pauseBeforeDelivery)
+        CrashReporting.metricRevocation = MetricRevocation()   // no cutoff from an earlier test
+        ConsentURLProtocol.afterVerdictForTesting = nil
         RecordingURLProtocol.installBehindConsentProtocol()
         ConsentGate.shared.setEnabled(true)
         let request = Task { try await outerSession().data(for: envelopeRequest()) }

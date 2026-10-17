@@ -46,4 +46,17 @@ public enum CrashReportingPreference {
     static func setPendingPurge(_ pending: Bool, in defaults: UserDefaults) {
         if pending { defaults.set(true, forKey: pendingPurgeKey) } else { defaults.removeObject(forKey: pendingPurgeKey) }
     }
+
+    /// Metric envelopes recorded before an opt-out may still be on disk (metrics spec §4.2).
+    /// Set at every opt-out before deleting; cleared only by the next SDK start's sweep or a
+    /// whole-cache purge: an envelope can be written after the in-process sweeps.
+    static let pendingMetricSweepKey = "crashReportingPendingMetricSweep"
+
+    static func hasPendingMetricSweep(in defaults: UserDefaults) -> Bool {
+        defaults.bool(forKey: pendingMetricSweepKey)
+    }
+
+    static func setPendingMetricSweep(_ pending: Bool, in defaults: UserDefaults) {
+        if pending { defaults.set(true, forKey: pendingMetricSweepKey) } else { defaults.removeObject(forKey: pendingMetricSweepKey) }
+    }
 }
