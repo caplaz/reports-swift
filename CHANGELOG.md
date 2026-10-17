@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.0 — 2026-10-17
+
+First stable release of privacy profiles (0.3.0-beta.1) and anonymous application metrics (0.3.0-beta.2); no changes since 0.3.0-beta.2. Verified end to end on TestFlight: detailed diagnostics (forwarded logs, stable installation ID), immediate downgrade when detailed diagnostics is turned off, metrics with only allowlisted attributes, and nothing delivered from an opted-out interval.
+
 ## 0.3.0-beta.2 — 2026-10-16
 
 ### Added
