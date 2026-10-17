@@ -1,7 +1,7 @@
 # Application metrics (ReportsKit 0.3.0-beta.2 + PatternSpace) — design
 
 Date: 2026-10-17
-Status: draft for owner review (decisions 1–2 from the owner; open questions in §12)
+Status: owner decisions recorded 2026-10-16 (Decisions table); no open questions (§12)
 Repos: `caplaz/reports-swift` (module `ReportsKit`, branch `feature/metrics` stacked on
 `feature/privacy-profiles`, today `0.3.0-beta.1`) and PatternSpace (`main`).
 Plan: `docs/superpowers/plans/2026-10-17-metrics.md` (PatternSpace repo).
@@ -23,10 +23,12 @@ any identifier, file name, path or free text.
 | 2 | Latency | Metrics flow while the app runs (SDK batch ≤ 5 s, §2.4), through `options.urlSession` and the consent gate. (Owner.) |
 | 3 | API | Typed `CrashReporting.Metric` declarations (name, kind, unit, allowed attribute keys **and values**); `count`, `distribution`, `gauge`, `duration(since:)`, `measure { }`, and a lock-only `Tally` for hot paths. Values outside a declared set are sent as `other`; undeclared keys are dropped. |
 | 4 | Gate | ReportsKit is the only producer: `beforeSendMetric` lets through only the metric ReportsKit is emitting on that thread (same thread-local pattern as logs), rebuilds its attributes from the declaration plus a fixed SDK allowlist, and drops everything else (direct `SentrySDK.metrics` calls included). |
-| 5 | Identity | No `user.id` (installation ID) on metrics in **either** profile. Strict: `trace_id` replaced by a fresh random ID per metric and `span_id` removed (the scope's trace ID is constant for the process, §2.3). Diagnostic: trace/span IDs kept, like logs. |
-| 6 | Volume | Per-process budget (60/min, 3,000/process) with a `reportskit.metrics.dropped` counter; hot paths aggregate with `Tally` (one count per 60 s at most). SDK envelope cache raised from 30 to 100 so offline metric batches can't evict queued error reports (§6). |
+| 5 | Identity | No `user.id` (installation ID) on metrics in **either** profile. Strict: `trace_id` replaced by a fresh random ID **per metric** and `span_id` removed (the scope's trace ID is constant for the process, §2.3). Diagnostic: trace/span IDs kept, like logs. (Owner.) |
+| 6 | Volume | Per-process budget **60/min, 3,000/process** with a `reportskit.metrics.dropped` counter; hot paths aggregate with `Tally` (one count per 60 s at most). SDK envelope cache raised from 30 to **100** (ReportsKit-wide) so offline metric batches can't evict queued error reports (§6). No remote kill switch. (Owner.) |
 | 7 | Version | Folded into 0.3.0 (still pre-release): **`0.3.0-beta.2`**. PatternSpace re-pins `exact: "0.3.0-beta.2"`. `CrashReportingConfiguration.metricsEnabled` (default `true`) mirrors `logsEnabled`. |
-| 8 | Labels | Every PatternSpace metric below is **Performance Data** (already declared). Feature-usage counters (**Product Interaction**, a new label category, and a change to the policy's "no analytics or usage tracking") are a separate optional task the owner can drop (§8.3). |
+| 8 | Labels | Every PatternSpace metric is **Performance Data** (already declared). **No feature-usage metrics**; the privacy policy keeps "there is no analytics or usage tracking". (Owner.) |
+| 9 | Opt-out | Metrics recorded before an opt-out and not yet sent are **deleted**, never delivered — also not after reporting is turned back on in the same process (§4.2). (Owner.) |
+| 10 | PatternSpace scope | Launch = process start → first main window. The throttled DeckLink "frame late"/"frame dropped" logs stay alongside the new tallies for now. (Owner.) |
 
 ## 1. What changes for users
 
@@ -34,8 +36,8 @@ any identifier, file name, path or free text.
 |---|---|---|
 | Strict profile | `enableMetrics = false` | metrics on; ReportsKit-declared metrics only, no ID, random trace ID |
 | Diagnostic profile | `enableMetrics = true`, gated `beforeSendMetric`, no producer | same metrics as strict; trace/span IDs kept; still no `user.id` |
-| Reporting off | nothing | nothing (facade no-op, queue re-check, `beforeSendMetric` gate, transport gate) |
-| PatternSpace | no metrics | 9 Performance-Data metrics (§8.2), optional usage counter (§8.3) |
+| Reporting off | nothing | nothing (facade no-op, queue re-check, `beforeSendMetric` gate, transport gate); metrics still pending at the opt-out are deleted (§4.2) |
+| PatternSpace | no metrics | 9 Performance-Data metrics (§8.2); no feature-usage metrics |
 
 ## 2. sentry-cocoa 9.24.0 facts (verified)
 
@@ -133,6 +135,76 @@ is unchanged and noted in §11.)
 - Cache cap: `maxCacheItems` default 30 (`Swift/Options.swift:130`); on overflow the
   **oldest** envelopes are deleted, whatever they contain (`Swift/Helper/SentryFileManager.swift:280-316`).
 
+### 2.5 Where pending metrics live, and what can reach them (for §4.2)
+
+Paths as in §2; `private interface` = `arm64-apple-macos.private.swiftinterface` next to the
+public one; `PrivateSentrySDKOnly.h` is in the framework's public `Headers/`. Items are cited
+as §2.5.1–§2.5.6.
+
+1. **SDK metric buffer (in memory).** `add` enqueues the already-sanitized metric on the
+   serial queue `io.sentry.metric-batcher` (`TelemetryBuffer.swift:61-65`); it becomes an
+   envelope when `performCaptureItems` calls the buffer's `capturedDataCallback`
+   (`:125-141`).
+   - **No hook at batch time.** The callback is fixed by the factory to
+     `scheduler.capture` (`TelemetryProcessor.swift:120-135`), which wraps the batch in a
+     one-item envelope and hands it to the transport (`TelemetryScheduler.swift:36-45`).
+     `beforeSendMetric` runs only when a metric is added (`SentryMetricsIntegration.swift:64-75`).
+     The processor is reachable only through `-[SentryClient getTelemetryProcessor]`, declared
+     in `Sentry/include/SentryClient+Private.h:117`, which the binary does not ship (its
+     `PrivateHeaders/` lack it). So ReportsKit cannot filter or clear a batch.
+   - **It can force the batch out synchronously.** `SentrySDK.flush(timeout:)`
+     (`Swift/Helper/SentrySDK.swift:658-660` → `Sentry/SentrySDKInternal.m:571-574` →
+     `Sentry/SentryHub.m:882-888` → `Sentry/SentryClient.m:673-682`) first calls
+     `forwardTelemetryData` (`:675`), whose `metricsBuffer.capture()` is a `dispatchSync` on the
+     batcher queue (`TelemetryProcessor.swift:42-46`, `TelemetryBuffer.swift:76-83`). It runs
+     after every `add` already enqueued and returns once the batch was handed to
+     `transport.sendEnvelope`. Only then does it wait for the transport (`:681`). Calling it on
+     the main thread is supported (`TelemetryBuffer.swift:72-75`). Nothing on the flush path
+     needs the main queue.
+2. **Transport queue (in memory, briefly).** `SentryHttpTransport.sendEnvelope`
+   (via `SentryDefaultTelemetryProcessorTransport.m:26-29`, `SentryTransportAdapter.m:92-96`)
+   first drops rate-limited items (`SentryHttpTransport.m:113-118`). It adds no client report
+   (`sendClientReports = false`, `:268-270`), then **stores asynchronously** on the private
+   serial queue `io.sentry.http-transport` (`:126-135`; queue `SentryTransportFactory.m:87-96`).
+   ReportsKit cannot reach that queue. The transport's own `flush` enqueues a
+   `sendAllCachedEnvelopes` behind the store (`:207-211`) and waits on a dispatch group
+   (`:213`), but any drain that ends (`finishedSending`, `:454-460`) also releases that group.
+   Concurrent drains are common (`SDKHarness.flush(until:)` documents the reachability one), so
+   a flush that returns is **not** a guarantee that the store ran.
+   - If the write fails, the envelope stays in memory (`notStoredEnvelopes`, `:127-132`) and is
+     sent first on the next drain (`:314-318`).
+3. **Disk.** `<cacheDirectoryPath>/io.sentry/<DSN hash>/envelopes/*.json`. The paths are built
+   at `SentryFileManagerHelper.m:145-149` (base), `:166-167` (DSN hash) and `:14,192`
+   (`envelopes`). Files are written under `@synchronized` (`:204-220`) with ascending names
+   (`:1014-1023`), and the transport sends the oldest first (`SentryHttpTransport.m:323`).
+   The envelopes are plain (uncompressed) SDK serializations. Reading:
+   `PrivateSentrySDKOnly.envelope(with:)` (`PrivateSentrySDKOnly.h:50` →
+   `PrivateSentrySDKOnly.m:42-45` → `SentrySerializationSwift.swift:96`) is the same
+   deserializer the transport uses (`SentryHttpTransport.m:331`), and the transport deletes an
+   undeserializable file without sending it (`:333-337`). `SentryEnvelope.items`,
+   `SentryEnvelopeItem.type()` and `.data`, and `SentryEnvelopeItemTypes.traceMetric` are SPI
+   (private interface `:820`, `:1802`, `:1794`, `:129`). A refused send (no HTTP response) keeps
+   the file (`SentryHttpTransport.m:407-410`); a 2xx/4xx/5xx response deletes it (`:433-447`).
+4. **Metric envelopes are never mixed in 9.24.0.** The scheduler builds one-item `trace_metric`
+   envelopes (`TelemetryScheduler.swift:40-42`). Nothing adds items to them later:
+   - client reports are off (`SentryHttpTransport.m:268-270`);
+   - rate limiting only removes items (`SentryEnvelopeRateLimit.m:29-47`);
+   - eviction's session-init migration rewrites only an envelope that already holds a
+     `session` item with the same session ID (`SentryMigrateSessionInit.swift:62-77`).
+5. **Wire.** Every send is one `POST` of the gzipped envelope through `options.urlSession`
+   (`SentryURLRequestFactory.swift:20-38`). `ConsentURLProtocol` already reads the whole
+   body before admitting it (`Sources/ReportsKit/ConsentURLProtocol.swift:33-52`). A
+   `trace_metric` item's payload is `{"items":[…]}` (`InMemoryInternalTelemetryBuffer.swift:28-30`),
+   and each metric's `timestamp` is encoded as seconds since 1970 (`:5-9`,
+   `Swift/Protocol/SentryMetric.swift:86-101`).
+6. **Envelope SPI for tests.** `SentryEnvelope(header:items:)`, `SentryEnvelopeItem(type:data:contentType:itemCount:)`,
+   `SentryEnvelopeHeader.empty()` (private interface `:818`, `:1795`, `:1314`);
+   `SentryNSURLRequestBuilder.createEnvelopeRequest(_:url:)` gzips like production
+   (`:1646`). `PrivateSentrySDKOnly.capture(_:)`/`store(_:)` (`PrivateSentrySDKOnly.h:43,45`)
+   reach the transport's `sendEnvelope` and the synchronous `SentryFileManager.store`
+   (`SentryHub.m:762-784`, `SentryClient.m:588-596,646-649`). ReportsKit already uses
+   `capture` (`CachedSessionRecovery.swift:35-36`).
+
 ## 3. ReportsKit API (0.3.0-beta.2)
 
 ```swift
@@ -181,13 +253,15 @@ Installed in both profiles:
 1. `ConsentGate.shared.isEnabled` else drop.
 2. `PendingMetric.current` (thread-local, set only around ReportsKit's own SDK call) must
    exist and match `name`, `value` and `unit`, else drop — this drops direct
-   `SentrySDK.metrics` calls from the app or any other library.
+   `SentrySDK.metrics` calls from the app or any other library. A pending metric admitted
+   before the latest opt-out (§4.2) is dropped too.
 3. Attributes rebuilt: SDK keys ∩ `{sentry.release, sentry.environment, sentry.sdk.name,
    sentry.sdk.version, os.name, os.version, device.brand, device.model, device.family}` (the
    strict log allowlist; never `user.*`, `sentry.replay_id`, scope attributes) + the
    declaration-filtered app attributes (as strings) + `sentry.environment` = resolved
    environment when known.
-4. `timestamp` = admission time (the SDK's is queue time).
+4. `timestamp` = admission time (the SDK's is queue time), issued by ReportsKit and strictly
+   increasing within the process (§4.2).
 5. Profile = `mostPrivate(started, currentSettingProfile())`: strict → `traceId = SentryId()`,
    `spanId = nil`; diagnostic → unchanged.
 
@@ -196,9 +270,9 @@ Installed in both profiles:
 | Situation | Result |
 |---|---|
 | Recorded while reporting is off (any profile) | Never captured: facade no-op. |
-| Admitted just before opt-out, still on the ReportsKit queue | Dropped: the queue re-checks the gate before calling the SDK. |
-| Inside the SDK call when the gate closes | `beforeSendMetric` reads the live gate after scope application on the same thread; whichever happens first wins — a metric that passed it was collected with consent. |
-| Captured before opt-out, in the 5 s buffer or on disk | Blocked on the wire while off (transport gate, as for logs: `optOutBlocksBufferedLogsOnTheWire`); deleted at the next launch if reporting is still off; **delivered if reporting is turned back on in the same process** (existing rule for everything collected with consent; see §12 Q1). |
+| Admitted just before opt-out, still on the ReportsKit queue | Dropped: the queue re-checks the gate and the revocation (§4.2) before calling the SDK. |
+| Inside the SDK call when the gate closes | `beforeSendMetric` reads the live gate after scope application on the same thread. If it passed first, the metric is in the SDK buffer and is handled like the next row. |
+| Captured before opt-out, in the 5 s buffer, the transport queue or on disk | **Deleted, never delivered** — also not after reporting is turned back on in the same process (decision 9, §4.2). |
 
 **No consent marker for metrics.** The event marker (`report.consent=off` scope tag) exists
 because events can be *collected* while off and *processed* later (crash/hang replay). Metrics
@@ -211,6 +285,113 @@ attributes anyway (`addScopeAttributes` reads scope *attributes*, `:121-126`).
 from that moment the strict rules apply (random trace ID).
 
 **Reporting off at launch:** the SDK is not started; `canRecordMetric()` is false.
+
+**Other telemetry is unchanged:** queued events, logs and sessions collected with consent are
+still delivered after an in-process re-enable (existing rule). Decision 9 applies to
+`trace_metric` envelopes only.
+
+### 4.2 Deleting pending metrics at opt-out (decision 9)
+
+**Short answer for the in-memory buffer:** sentry-cocoa 9.24.0 has no hook when a metric
+batch is formed or flushed (§2.5.1). ReportsKit can't stop a sanitized metric from becoming
+an envelope. What it can do:
+
+- force the buffer into an envelope synchronously at opt-out, while the gate is closed;
+- delete that envelope from disk;
+- refuse delivery of any metric envelope, wherever it was, through a check made when the
+  request is sent.
+
+Only one case falls outside "deleted at opt-out". The forced envelope is written to disk
+asynchronously on a queue ReportsKit can't wait on (§2.5.2). If it lands after the opt-out
+sweep, it is deleted later by one of three steps below (re-enable sweep, wire check, or
+next-launch sweep), and it is **never delivered**.
+
+**Revocation cutoff (`MetricRevocation`).** Each metric's admission timestamp comes from
+ReportsKit. It is strictly increasing in the process: at least 1 ms after the previous one,
+even if the wall clock steps back. While the clock is behind, timestamps run up to that far
+ahead of it. Opt-out sets `cutoff` = the last timestamp issued and stops admission. Re-enable
+reopens admission, and every later timestamp is > `cutoff`. So "admitted before the latest
+opt-out" is exactly `timestamp ≤ cutoff`. This works without trusting the clock, in both
+profiles, and needs no attribute that would be sent to Sentry. Admission and revocation share
+one lock, so a racing `record` either gets a timestamp ≤ `cutoff` or no timestamp at all.
+
+**Opt-out** (`applyConsent(false)`, inside the serialized transition, after the gate,
+consent marker, hang and trace steps):
+
+1. Persist `pendingMetricSweep = true` (before deleting anything, like `pendingPurge`).
+2. `metricRevocation.revoke()`.
+3. `metricQueue.sync {}`. The queue is serial, so every ReportsKit emission queued or
+   running finishes before this returns. Those that start now see the closed gate (and the
+   revocation) and are dropped. Only ReportsKit emissions pass `beforeSendMetric`
+   (decision 4), so afterwards every metric that passed it has been enqueued in the SDK
+   buffer (`TelemetryBuffer.swift:61-65`).
+4. `SentrySDK.flush(timeout: 1)` if the SDK runs. It forwards the metric (and log) buffers to
+   the transport synchronously (§2.5.1). The gate is closed, so every send attempt is refused
+   (no response) and the files stay. Logs keep their existing rule.
+5. Sweep (`deleteMetricEnvelopes`): every file in `io.sentry/*/envelopes/` that deserializes
+   to an envelope with a `trace_metric` item is removed with ReportsKit's
+   `removeItem`/`remove` (absence counts as success; the result is checked). Most of the time
+   the flush in step 4 returns only after its own drain, which is queued behind the forced
+   store (§2.5.2), so the forced envelope is already on disk and deleted here. A failed
+   removal leaves the gate closed; nothing else is needed yet, because re-enable sweeps again.
+
+**Re-enable in the same process** (`applyConsent(true)`, SDK running, before the consent
+marker is removed and the gate reopens):
+
+1. `SentrySDK.flush(timeout: 1)` with the gate still closed, so a late forced envelope lands.
+2. Sweep again. **If any removal fails: fail closed.** Set `pendingPurge`, leave the gate
+   closed, stop. Reporting stays off for this process, and the next start purges the whole
+   cache before starting, or doesn't start (existing `startSDK` behaviour).
+3. `metricRevocation.reopen()`, then the existing steps (marker removed, gate, traces,
+   sessions, drain).
+
+**Wire check (backstop, `ConsentURLProtocol`).** It only runs in a process that has opted
+out at least once (`cutoff` set); other processes skip it without parsing. For every upload
+it gunzips the body and deserializes it with the SDK's own parser. If any `trace_metric`
+item holds a metric with `timestamp ≤ cutoff`, or has no readable timestamp, the request is
+answered with a **synthetic HTTP 200** and never forwarded. The transport then deletes the
+envelope (`SentryHttpTransport.m:433-447`) and moves on to the next one. This catches the
+forced envelope even when it landed after both sweeps, is still in `notStoredEnvelopes`
+(failed write, §2.5.2), or is sent by a drain started before the flush.
+
+A body that can't be gunzipped or deserialized is **refused** (no response). The file stays
+and the transport stops draining for the rest of the process. That is fail-closed without
+destroying a possible crash report, and it can't happen with SDK-built bodies (§2.5.5). The
+next launch has no cutoff, so the file is sent then. If it was a metric envelope, the launch
+sweep deletes it first.
+
+**Next launch** (`prepareCache`, before `SentrySDK.start`, nothing sending):
+
+- If `pendingMetricSweep` is set: sweep, then clear the flag.
+- If the sweep fails: set `pendingPurge` and fail closed (`startSDK` doesn't start).
+- A whole-cache purge (`purgeCache`) also clears the flag.
+
+This covers a process that exited between a late store and its send attempt. The flag is
+never cleared in-process: a late landing can't be ruled out there. As a result, metric
+envelopes still queued at the next launch after an opt-out are deleted even if they were
+recorded after the re-enable. That over-deletion is deliberate: they are low-value
+performance numbers.
+
+**Mixed envelopes.** The sweep deletes any envelope containing a `trace_metric` item, and
+the wire check drops it whole. In 9.24.0 such envelopes always have exactly one item
+(§2.5.4), so no other item is ever discarded. A future SDK that batches metrics with other
+items would be caught by the envelope-shape test (§10). Until the rule is revisited,
+dropping the whole envelope is the fail-closed choice. Rewriting SDK envelope files in place
+would mean ReportsKit re-serializing them, a path only the SDK's private migration uses.
+
+**Rejected alternatives.**
+
+- A sentinel envelope sent through `PrivateSentrySDKOnly.capture` as a FIFO barrier on the
+  transport queue: the rate limiter drops it under any `all`-category back-off
+  (`SentryEnvelopeRateLimit.m:53-58`, `DefaultRateLimits.swift:33-41`), so the barrier would
+  time out exactly when the proxy is backing off.
+- Calling `getTelemetryProcessor` through the ObjC runtime: the selector is undeclared in the
+  shipped headers (§2.5.1), and it would only forward the buffer, which `flush` already does.
+- Clearing `notStoredEnvelopes` via KVC: private, unversioned state.
+
+**Cost.** Each opt-out and re-enable blocks the main thread for at most ~1 s (the flush
+timeout) plus a directory scan, which is typically a few milliseconds. The wire check
+gunzips at most one ≤ 1 MB body per upload, and only after an opt-out.
 
 ## 5. Provenance
 
@@ -238,7 +419,8 @@ an earlier launch to re-evaluate except envelopes already sanitized at capture (
   log and session envelopes (§2.4). 100 envelopes ≈ 8 minutes of continuous worst-case activity;
   the budget keeps typical sessions far below. (SentryCrash reports are stored by the crash
   reporter and converted at the next launch, so crashes are not at risk.)
-- Kill switch: none remote in this design (§12 Q6).
+- Kill switch: none (owner decision 6); stopping metrics needs an app update with
+  `metricsEnabled: false`.
 
 ## 7. README / guarantees changes (reports-swift)
 
@@ -246,6 +428,8 @@ an earlier launch to re-evaluate except envelopes already sanitized at capture (
 - Privacy profiles table: Metrics row → "ReportsKit-declared only; no ID; random trace ID |
   same; trace/span IDs kept; no `user.id`".
 - "What is not sent": replace the "no metrics producer" sentences.
+- Opt-out guarantee: metrics recorded before turning reporting off are deleted and never sent,
+  also if it is turned back on in the same process (§4.2).
 - CHANGELOG `## 0.3.0-beta.2`.
 
 ## 8. PatternSpace instrumentation
@@ -276,24 +460,13 @@ an earlier launch to re-evaluate except envelopes already sanitized at capture (
 | `decklink.frames.late` / `decklink.frames.dropped` | counter (via `Tally`, ≤ 1 per 60 s each) | `mode`, `transfer` | same file, completion callback `:188-198`; `flush()` in `stop()` `:223-238` |
 
 The existing throttled `CrashReporting.log(.warning, "frame late"/"frame dropped")` calls
-stay for one beta so the two can be compared (§12 Q5).
+stay for now (decision 10). Removing them is a later, separate change.
 
-Note: counts of these durations incidentally show how often operations run. They are
-collected and used as performance data (latency and failure rates per format/mode), not to
-study feature usage; §12 Q4 asks whether to declare Product Interaction anyway.
-
-### 8.3 Optional — Product Interaction (separate task, owner may drop)
-
-| Metric | Type | Attributes | Where |
-|---|---|---|---|
-| `feature.window.opened` | counter | `window`: icc_builder, lut_tools, lut_analysis, help | `.onAppear` of each `Window` root in `Apps/macOS/Sources/PatternSpaceApp.swift:183-215` |
-
-Keeping it requires: App Store label **Usage Data → Product Interaction** (Linked to you,
-consistent with the current label line; Not used for tracking; App Functionality /
-Analytics), privacy.html "there is no analytics or usage tracking" (`web/privacy.html:70-71`)
-and "There are no analytics or update checks" (`:130`) rewritten, a footer variant that
-mentions "which tools you open", and AGENTS.md. It also overlaps the planned self-hosted
-analytics (`caplaz/analytics-swift`, Phase 4) — another reason it is optional.
+Note: the number of recorded durations incidentally shows how often operations run. These
+metrics are collected and used only as performance data: latency and failure rates per
+format or mode. PatternSpace records no feature-usage metrics (decision 8), so the privacy
+policy's "there is no analytics or usage tracking" stays true and the label stays
+Performance Data only.
 
 ## 9. Disclosures
 
@@ -306,7 +479,7 @@ analytics (`caplaz/analytics-swift`, Phase 4) — another reason it is optional.
     files, file names, error text, or an identifier for you or your device."
   - iOS: "…(crash location, app and iOS version, device model) and anonymous performance
     measurements, such as how long the app takes to launch, to help fix problems. Unless …"
-  - de/es/fr/it in the plan (Task B6), German Sie-form, Spanish usted, Italian tu (matching
+  - de/es/fr/it in the plan (Task B7), German Sie-form, Spanish usted, Italian tu (matching
     the existing footers). The accessibility hint ("Sends anonymous crash and diagnostic data
     to help fix problems.") stays: performance data is diagnostic data.
 - **privacy.html:** the crash-reports item replaces "occasionally sends anonymous performance
@@ -337,10 +510,28 @@ command under `timeout`):
 - SDK envelopes in `SerialSuite` via `RecordingURLProtocol` and `SDKHarness.flush(until:)`:
   strict `trace_metric` item has only allowlisted attributes, no `user.*`, no planted
   installation ID or scope attribute, no needles, and two metrics have different `trace_id`s;
-  diagnostic metrics share the `trace_id` and have no `user.id`; direct `SentrySDK.metrics`
-  calls are dropped; metrics recorded while opted out never arrive (also after re-enable);
-  a metric admitted to the queue before opt-out (queue suspended) is dropped; buffered metrics
-  are blocked on the wire after opt-out; budget overflow produces `reportskit.metrics.dropped`.
+  every metric envelope has exactly one item (pins §2.5.4); diagnostic metrics share the
+  `trace_id` and have no `user.id`; direct `SentrySDK.metrics` calls are dropped; metrics
+  recorded while opted out never arrive (also after re-enable); a metric admitted to the
+  queue before opt-out (queue held by a blocked work item, never `suspend()`ed — the opt-out
+  barrier syncs on it) is dropped; budget overflow produces `reportskit.metrics.dropped`.
+- Deletion at opt-out (§4.2), envelope level:
+  - a metric recorded and buffered, then opt-out and re-enable in the same process: no
+    `trace_metric` item with it is ever delivered, while a metric recorded after re-enable is;
+  - a metric envelope already on disk (network failing) is deleted by the opt-out, a queued
+    event envelope is kept and delivered after re-enable, no `trace_metric` is delivered;
+  - a pre-cutoff metric envelope that reaches the transport after re-enable (planted with
+    `PrivateSentrySDKOnly.capture`) is swallowed on the wire and deleted from disk; the same
+    envelope is delivered in a process that never opted out (control);
+  - a removal failure (`removeItem` seam) keeps the gate closed after re-enable and sets
+    `pendingPurge`, and the next launch purges and delivers no metric;
+  - a metric envelope left on disk by a process that opted out is deleted by the next
+    launch's sweep before anything is sent, and the flag is cleared.
+- Unit: `MetricRevocation` (strictly increasing timestamps with a clock stepping back; revoke
+  closes admission and sets the cutoff; reopen issues timestamps > cutoff; wire verdicts on
+  SDK-gzipped bodies: old metric → swallow, new → forward, event → forward, no cutoff →
+  forward without parsing, corrupt gzip → refuse); `deleteMetricEnvelopes` on SDK-serialized
+  files (metric removed, event kept, unreadable file skipped, failure reported).
 - Main-thread rule unchanged for `start`/`setEnabled`; recording tests call from main and
   from a detached task.
 
@@ -359,25 +550,22 @@ both apps build Debug + Release; pre-tag gate.
 | Quota exhaustion / proxy back-off | Budget, `Tally`, ≤ 12 envelopes/min; monitor Sentry Stats |
 | Offline eviction of queued reports | `maxCacheItems` 100 + budget |
 | Hot-path cost (DeckLink completion thread) | `Tally.add` is one lock + add; SDK work on a utility queue |
-| sentry-cocoa internals (synchronous `beforeSendMetric`, applier keys) change on bump | Exact pin; envelope tests assert both |
-| Label/policy mismatch if feature counters ship | Optional task carries its own disclosure steps |
+| sentry-cocoa internals (synchronous `beforeSendMetric`, applier keys, envelope paths, one-item metric envelopes, deserializer SPI) change on bump | Exact pin; envelope and deletion tests assert each; re-verify §2.5 on every bump |
+| A pre-opt-out metric envelope is written after both sweeps (async store, §2.5.2) | Wire check swallows it (synthetic 200 → transport deletes it); next-launch sweep |
+| Deletion fails (permissions, I/O) | Fail closed: gate stays closed after re-enable, `pendingPurge` → whole-cache purge or no start next launch |
+| Unparseable upload body after an opt-out stalls the transport for the process | Refused, not swallowed (no data destroyed); SDK-built bodies always parse (§2.5.5); next launch sends it |
+| Main thread blocked during a consent toggle | ≤ ~1 s flush timeout + directory scan; typically milliseconds |
+| Timestamps ahead of the wall clock after it steps back | Bounded by the step-back size; only in that case; Sentry stores the given value |
+| Metrics queued at the next launch after an opt-out are deleted, including post-re-enable ones | Deliberate over-deletion (privacy first); low-value data |
 
 ## 12. Open questions for the owner
 
-1. **Queued metrics after re-enable.** Metrics captured with consent but still queued at
-   opt-out are delivered if the user turns reporting back on in the same process (same rule
-   as events/logs). Acceptable, or should metric envelopes be deleted at opt-out (needs
-   ReportsKit to scan the SDK's envelope directory; racy with the transport)?
-2. **Diagnostic identity.** Proposed: no `user.id` on metrics in either profile (decision 1),
-   trace/span IDs kept in diagnostic. Alternatives: random trace ID in diagnostic too, or keep
-   `user.id` in diagnostic (as logs do).
-3. **Cache size** 30 → 100 envelopes (ReportsKit-wide, all apps). OK?
-4. **Product Interaction:** ship `feature.window.opened` (new label category + policy rewrite)
-   or drop it? And should the duration metrics' implicit counts be declared as Product
-   Interaction anyway (conservative reading)?
-5. **DeckLink logs:** remove the throttled "frame late"/"frame dropped" logs once the tallies
-   are verified (next beta)?
-6. **Remote kill switch:** add an env flag to `reports-proxy` that strips `trace_metric` items
-   (no app update needed to stop metrics) — separate proxy change?
-7. **Budget numbers** (60/min, 3,000/process) and the **launch definition** (process start →
-   first main window visible, including the iOS splash).
+None. The owner answered every earlier question on 2026-10-16:
+
+- deletion at opt-out → decision 9, §4.2;
+- identity → decision 5;
+- cache size → decision 6;
+- no feature-usage metrics → decision 8;
+- DeckLink logs → decision 10;
+- kill switch → decision 6;
+- budget and launch definition → decisions 6 and 10.
