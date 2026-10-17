@@ -1,7 +1,9 @@
 # Application metrics (ReportsKit 0.3.0-beta.2 + PatternSpace) — design
 
 Date: 2026-10-17
-Status: owner decisions recorded 2026-10-16 (Decisions table); no open questions (§12)
+Status: owner decisions recorded 2026-10-16 (Decisions table); no open questions (§12).
+Revised 2026-10-16 for review findings: wire verdict bound to admission (§4.2 "Wire check"),
+fail-closed sweeps (§4.2 "Sweep"), `Tally` across consent changes (§3, §4.2 "Revocation epoch").
 Repos: `caplaz/reports-swift` (module `ReportsKit`, branch `feature/metrics` stacked on
 `feature/privacy-profiles`, today `0.3.0-beta.1`) and PatternSpace (`main`).
 Plan: `docs/superpowers/plans/2026-10-17-metrics.md` (PatternSpace repo).
@@ -222,7 +224,7 @@ let data = try await CrashReporting.measure(.exportDuration, attributes: ["forma
     try await exporter.run()          // outcome added: success / cancelled / failure
 }
 let late = CrashReporting.Tally(.framesLate, attributes: ["mode": "hd1080p25"])
-late.add()                            // hot path: one lock, no SDK work
+late.add()                            // hot path: lock-only, no SDK work
 late.flush()                          // at session end
 ```
 
@@ -244,6 +246,15 @@ late.flush()                          // at session end
 - `Tally(_ metric:, attributes:, interval: 60)`: `add(_ n: UInt = 1)` accumulates under a lock;
   the first `add` after `interval` has elapsed since the window opened records one `count`
   with the sum; `flush()` records what is pending. Counter metrics only.
+- `Tally` and consent (decision 9, §4.2 "Revocation epoch"):
+  - `add` is a no-op while a metric can't be recorded (`canRecordMetric()` false, or between
+    revoke and reopen).
+  - The pending total is tagged with the revocation epoch it was counted in. A total from an
+    earlier epoch is discarded, never sent, at the next `add` (which also reopens the window)
+    or at `flush`.
+  - The emission carries the epoch and is admitted only while it is current, under
+    `MetricRevocation`'s lock. A flush that took its total before an opt-out and reaches
+    admission after the re-enable records nothing.
 - `CrashReportingConfiguration.metricsEnabled: Bool = true` → `options.enableMetrics`.
 
 ## 4. Sanitizer and gate (`beforeSendMetric`)
@@ -273,6 +284,8 @@ Installed in both profiles:
 | Admitted just before opt-out, still on the ReportsKit queue | Dropped: the queue re-checks the gate and the revocation (§4.2) before calling the SDK. |
 | Inside the SDK call when the gate closes | `beforeSendMetric` reads the live gate after scope application on the same thread. If it passed first, the metric is in the SDK buffer and is handled like the next row. |
 | Captured before opt-out, in the 5 s buffer, the transport queue or on disk | **Deleted, never delivered** — also not after reporting is turned back on in the same process (decision 9, §4.2). |
+| Upload whose wire verdict was taken before the opt-out, admitted after the re-enable | Not forwarded: the gate sees the verdict's epoch is stale, the request is decided again against the new cutoff (swallowed) (§4.2 "Wire check"). |
+| `Tally` total pending at the opt-out, or adds while off | Discarded, never sent, also when the flush races the re-enable (§3, §4.2 "Revocation epoch"). |
 
 **No consent marker for metrics.** The event marker (`report.consent=off` scope tag) exists
 because events can be *collected* while off and *processed* later (crash/hang replay). Metrics
@@ -315,6 +328,15 @@ opt-out" is exactly `timestamp ≤ cutoff`. This works without trusting the cloc
 profiles, and needs no attribute that would be sent to Sentry. Admission and revocation share
 one lock, so a racing `record` either gets a timestamp ≤ `cutoff` or no timestamp at all.
 
+**Revocation epoch.** Every `revoke()` also starts a new epoch, even when nothing was issued
+yet (no cutoff). The cutoff changes only in `revoke()`. So a decision taken under an epoch that
+is still current was taken against the current cutoff, and a decision from an older epoch
+must be taken again. Two decisions depend on this:
+
+- the wire verdict, re-checked atomically with gate admission ("Wire check" below);
+- `Tally`'s pending totals (§3). `MetricRevocation.admit(epoch:)` issues a timestamp only while
+  the given epoch is current, in the same critical section as revocation.
+
 **Opt-out** (`applyConsent(false)`, inside the serialized transition, after the gate,
 consent marker, hang and trace steps):
 
@@ -333,15 +355,30 @@ consent marker, hang and trace steps):
    `removeItem`/`remove` (absence counts as success; the result is checked). Most of the time
    the flush in step 4 returns only after its own drain, which is queued behind the forced
    store (§2.5.2), so the forced envelope is already on disk and deleted here. A failed
-   removal leaves the gate closed; nothing else is needed yet, because re-enable sweeps again.
+   sweep leaves the gate closed; nothing else is needed yet, because re-enable sweeps again.
+
+**Sweep (fails closed).** The sweep succeeds only when it inspected every envelope and every
+metric envelope is gone. The same rules apply at opt-out, re-enable and launch:
+
+| Situation | Result |
+|---|---|
+| No `io.sentry` directory, a DSN directory without `envelopes`, a file deleted between listing and reading | Absent: success |
+| Listing a directory fails (other than "no such file"), or a DSN entry's `isDirectory` can't be read | Failure |
+| An envelope file can't be read (other than "no such file") | Failure: it may hold a metric |
+| A file the SDK can't deserialize | Removed. The transport would delete it unsent (`SentryHttpTransport.m:331-337`), and envelopes are written atomically (`SentryFileManagerHelper.m:592-599`), so nothing deliverable is lost |
+| A removal fails | Failure |
+
+After a failure the sweep keeps going and deletes what it can. Listing and reading go through
+test seams (`listDirectory`, `readFile`), like `removeItem`.
 
 **Re-enable in the same process** (`applyConsent(true)`, SDK running, before the consent
 marker is removed and the gate reopens):
 
 1. `SentrySDK.flush(timeout: 1)` with the gate still closed, so a late forced envelope lands.
-2. Sweep again. **If any removal fails: fail closed.** Set `pendingPurge`, leave the gate
-   closed, stop. Reporting stays off for this process, and the next start purges the whole
-   cache before starting, or doesn't start (existing `startSDK` behaviour).
+2. Sweep again. **If the sweep fails (listing, reading or removal): fail closed.** Set
+   `pendingPurge`, leave the gate closed, stop. Reporting stays off for this process, and the
+   next start purges the whole cache before starting, or doesn't start (existing `startSDK`
+   behaviour).
 3. `metricRevocation.reopen()`, then the existing steps (marker removed, gate, traces,
    sessions, drain).
 
@@ -354,6 +391,23 @@ envelope (`SentryHttpTransport.m:433-447`) and moves on to the next one. This ca
 forced envelope even when it landed after both sweeps, is still in `notStoredEnvelopes`
 (failed write, §2.5.2), or is sent by a drain started before the flush.
 
+The verdict and the admission are **one decision**. Otherwise a request could get `.forward`
+(say, before the first opt-out, with no cutoff), pause, span an opt-out and re-enable, and
+then be admitted by the reopened gate. So:
+
+- `checkedVerdict` reads the cutoff and the epoch together and returns the verdict with the
+  epoch it was decided under.
+- A `.forward` request is admitted only through `ConsentGate.admit(while:)`, which checks
+  under the gate's lock that the gate is open **and** that epoch is still current.
+- Any opt-out between verdict and admission either finds the gate closed (refused) or, after
+  the re-enable, a new epoch (`stale`). A stale request is decided again against the new
+  cutoff, at most 3 times, then refused.
+- An opt-out that starts after the admission cancels the admitted task, as for every upload.
+- `.swallow` and `.refuse` need no epoch check. The cutoff only grows (it is the last issued
+  timestamp, strictly increasing), so a metric pre-cutoff under an old epoch is pre-cutoff
+  under the current one; a refusal sends nothing.
+- Lock order: gate, then revocation; the revocation lock never takes the gate's.
+
 A body that can't be gunzipped or deserialized is **refused** (no response). The file stays
 and the transport stops draining for the rest of the process. That is fail-closed without
 destroying a possible crash report, and it can't happen with SDK-built bodies (§2.5.5). The
@@ -363,7 +417,11 @@ sweep deletes it first.
 **Next launch** (`prepareCache`, before `SentrySDK.start`, nothing sending):
 
 - If `pendingMetricSweep` is set: sweep, then clear the flag.
-- If the sweep fails: set `pendingPurge` and fail closed (`startSDK` doesn't start).
+- If the sweep fails (listing, reading or removal, see "Sweep" above): keep the flag, set
+  `pendingPurge` and fail closed (`startSDK` doesn't start, the gate stays closed). The next
+  start (the next launch, or `setEnabled(true)` in this process) purges the whole cache
+  before starting. That purge doesn't need to inspect the cache, so it recovers even while
+  the cache stays unreadable; otherwise it fails closed again (existing rule).
 - A whole-cache purge (`purgeCache`) also clears the flag.
 
 This covers a process that exited between a late store and its send attempt. The flag is
@@ -523,15 +581,31 @@ command under `timeout`):
   - a pre-cutoff metric envelope that reaches the transport after re-enable (planted with
     `PrivateSentrySDKOnly.capture`) is swallowed on the wire and deleted from disk; the same
     envelope is delivered in a process that never opted out (control);
+  - an upload paused (test seam) right after a `.forward` verdict, then opt-out and re-enable,
+    then resumed: the gate reports the verdict stale, it is decided again (`.swallow`), answered
+    with the synthetic 200 and never forwarded;
   - a removal failure (`removeItem` seam) keeps the gate closed after re-enable and sets
     `pendingPurge`, and the next launch purges and delivers no metric;
   - a metric envelope left on disk by a process that opted out is deleted by the next
-    launch's sweep before anything is sent, and the flag is cleared.
+    launch's sweep before anything is sent, and the flag is cleared;
+  - the next launch's sweep with an injected listing failure, and separately an injected read
+    failure: the flag is kept, `pendingPurge` set, the SDK not started, the envelope still on
+    disk; then `setEnabled(true)` purges the cache, clears both flags, starts, delivers no
+    metric;
+  - `Tally` end to end: accumulate, opt out, add while off, re-enable, flush → nothing sent;
+    later adds are sent. A total taken before the opt-out and emitted after the re-enable,
+    with its old epoch, is not recorded.
 - Unit: `MetricRevocation` (strictly increasing timestamps with a clock stepping back; revoke
   closes admission and sets the cutoff; reopen issues timestamps > cutoff; wire verdicts on
   SDK-gzipped bodies: old metric → swallow, new → forward, event → forward, no cutoff →
-  forward without parsing, corrupt gzip → refuse); `deleteMetricEnvelopes` on SDK-serialized
-  files (metric removed, event kept, unreadable file skipped, failure reported).
+  forward without parsing, corrupt gzip → refuse; every revoke starts a new epoch,
+  `admit(epoch:)` refuses an old one, `checkedVerdict` carries its epoch);
+  `ConsentGate.admit(while:)` (closed before validity, stale without building a task, admitted
+  tasks still revoked); `deleteMetricEnvelopes` on SDK-serialized files (metric removed, event
+  kept, undeserializable file removed, removal failure reported; absent cache and vanished
+  file → success; injected listing or read failure → failure, file kept); `Tally` with
+  injected consent (adds while off ignored, old-epoch totals discarded at `add` and `flush`,
+  emissions tagged with their epoch).
 - Main-thread rule unchanged for `start`/`setEnabled`; recording tests call from main and
   from a detached task.
 
@@ -549,10 +623,12 @@ both apps build Debug + Release; pre-tag gate.
 | Per-process linkage via `trace_id` | Random per metric in strict. Existing events/logs keep the process trace ID in strict (unchanged, out of scope) |
 | Quota exhaustion / proxy back-off | Budget, `Tally`, ≤ 12 envelopes/min; monitor Sentry Stats |
 | Offline eviction of queued reports | `maxCacheItems` 100 + budget |
-| Hot-path cost (DeckLink completion thread) | `Tally.add` is one lock + add; SDK work on a utility queue |
+| Hot-path cost (DeckLink completion thread) | `Tally.add` is a few uncontended locks (consent check + its own) + add; SDK work on a utility queue |
 | sentry-cocoa internals (synchronous `beforeSendMetric`, applier keys, envelope paths, one-item metric envelopes, deserializer SPI) change on bump | Exact pin; envelope and deletion tests assert each; re-verify §2.5 on every bump |
 | A pre-opt-out metric envelope is written after both sweeps (async store, §2.5.2) | Wire check swallows it (synthetic 200 → transport deletes it); next-launch sweep |
-| Deletion fails (permissions, I/O) | Fail closed: gate stays closed after re-enable, `pendingPurge` → whole-cache purge or no start next launch |
+| Wire verdict taken before an opt-out, admission after the re-enable | Verdict bound to its revocation epoch; gate admission re-checks it under the gate's lock; stale → decided again |
+| Deletion fails (permissions, I/O), or the cache can't be listed or an envelope read | Fail closed: gate stays closed after re-enable, `pendingPurge` → whole-cache purge or no start next launch; a failed launch sweep keeps `pendingMetricSweep` and doesn't start |
+| `Tally` total spans an opt-out (pending, or flushed concurrently with the re-enable) | No adds while off; totals tagged with the revocation epoch, discarded when it changes; emission admitted only under that epoch |
 | Unparseable upload body after an opt-out stalls the transport for the process | Refused, not swallowed (no data destroyed); SDK-built bodies always parse (§2.5.5); next launch sends it |
 | Main thread blocked during a consent toggle | ≤ ~1 s flush timeout + directory scan; typically milliseconds |
 | Timestamps ahead of the wall clock after it steps back | Bounded by the step-back size; only in that case; Sentry stores the given value |
