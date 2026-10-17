@@ -5,11 +5,12 @@ extension CrashReporting {
     /// (sentry-cocoa reads its options only at `start`); see `activeProfile`.
     public enum PrivacyProfile: String, Sendable, CaseIterable {
         /// Default. No user content and no stable identifier (README "Privacy guarantees").
-        /// Release-health sessions use an identifier that is random for each launch.
+        /// Release-health sessions use an identifier that is random for each launch. Metrics
+        /// (declared, anonymous) are sent in both profiles.
         case strict
         /// Opt-in ("Share detailed diagnostics" on and reporting on): error text, file names
-        /// and paths, forwarded app logs, a stable installation identifier, sessions and
-        /// metrics. Never the device name, IP address, screenshots or view hierarchy.
+        /// and paths, forwarded app logs, a stable installation identifier and sessions.
+        /// Never the device name, IP address, screenshots or view hierarchy.
         case diagnostic
 
         /// The more private of two profiles.

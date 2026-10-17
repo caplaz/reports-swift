@@ -195,6 +195,46 @@ the next sent line carries `report.dropped`) and emits on a background queue, so
 on hot threads. Tell users exactly what the setting sends — see the table below — including
 that file paths and error text often contain the user's account name (`/Users/<name>/…`).
 
+### 7. Record metrics (optional)
+
+Declare every metric once, with the only attribute keys and values it may carry:
+
+```swift
+extension CrashReporting.Metric {
+    static let exportDuration = Self(
+        "export.duration", kind: .distribution, unit: .millisecond,
+        attributes: ["format": ["cube", "3dl"], "outcome": Self.outcomes])
+    static let framesLate = Self("output.frames_late", kind: .counter)
+}
+
+let start = ContinuousClock.now
+// …
+CrashReporting.duration(.exportDuration, since: start, attributes: ["format": "cube"], outcome: "success")
+try await CrashReporting.measure(.exportDuration, attributes: ["format": "3dl"]) { try await export() }
+
+let late = CrashReporting.Tally(.framesLate)   // hot paths: lock-only adds, ≤ 1 count per minute
+late.add()
+late.flush()                                    // when the activity ends
+```
+
+Metrics are sent in **both** profiles while reporting is on (disclose them as anonymous
+performance data). Names, keys and values are static identifiers (`[a-z0-9_.]` names,
+`[A-Za-z0-9_.-]` values, ≤ 4 keys); a value not declared for its key is sent as `other`, an
+undeclared key is dropped. Each metric carries only those attributes plus `sentry.release`,
+`sentry.environment`, `sentry.sdk.*`, `os.name/version`, `device.brand/model/family` — never
+`user.id` or any other identifier; in `strict` each metric also gets a fresh random trace ID.
+Calls are safe from any thread, budgeted (60 per minute, 3,000 per process; overflow is
+reported as `reportskit.metrics.dropped`) and batched by the SDK (sent within ~5 s). Metrics
+the app sends directly through `SentrySDK.metrics` are dropped. `metricsEnabled: false` in the
+configuration turns them off.
+
+Turning reporting off deletes the metrics recorded before it that haven't been sent yet. They
+are never delivered, also not if reporting is turned back on in the same process. Queued
+crash reports, errors and logs keep the existing rule. Toggling "Send crash reports" briefly
+blocks the main thread (at most about a second) while ReportsKit flushes the SDK's metric
+buffer, with uploads blocked, and deletes the metric envelopes. A `Tally` counts only while
+reporting is on, and a total still pending at an opt-out is discarded, never sent.
+
 ## Privacy guarantees
 
 ### Privacy profiles
@@ -208,7 +248,7 @@ that file paths and error text often contain the user's account name (`/Users/<n
 | Installation ID | stripped everywhere | `user.id` on events and logs |
 | Sessions | yes, random ID per launch | yes, installation ID |
 | Paths and error text may contain the account name (`/Users/<name>/`) | no | yes |
-| Metrics | off | ingestion path enabled, consent-gated — unused today (ReportsKit has no metrics producer yet) |
+| Metrics (declared via `CrashReporting.Metric`) | yes — declared attributes + non-identifying SDK attributes, random trace ID per metric, no `user.id` | same, trace/span IDs kept, still no `user.id` |
 | Device name, IP, screenshots, view hierarchy | never | never |
 
 The profile is chosen at SDK start: `diagnostic` only when both stored settings,
@@ -303,11 +343,11 @@ In the `strict` profile: no user or installation identifier (the SDK's installat
 stripped from every event and log, and the file holding it is deleted at every start, so
 release-health sessions carry an identifier that is new for each launch and none is shared
 across launches), no file names or
-paths, no error text beyond `describeError`, no forwarded app logs, no metrics. In every
+paths, no error text beyond `describeError`, no forwarded app logs. In every
 profile: no screenshots or view hierarchies, no device or computer name, no network
 breadcrumbs or network/file-I/O/Core Data tracing, no failed-request events for the app's
-own `URLSession`s, and no client reports. `CrashReporting` has no metrics producer, so no
-metrics are sent in either profile today even though `diagnostic` enables the ingestion path.
+own `URLSession`s, and no client reports. Metrics carry only their declared attributes (see
+§7); metrics recorded through `SentrySDK.metrics` directly are dropped.
 With a proxy DSN, Sentry sees the proxy's egress IP instead of the user's.
 
 ## sentry-cocoa is pinned exactly

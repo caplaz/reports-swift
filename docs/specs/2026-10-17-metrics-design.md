@@ -348,8 +348,12 @@ consent marker, hang and trace steps):
    (decision 4), so afterwards every metric that passed it has been enqueued in the SDK
    buffer (`TelemetryBuffer.swift:61-65`).
 4. `SentrySDK.flush(timeout: 1)` if the SDK runs. It forwards the metric (and log) buffers to
-   the transport synchronously (§2.5.1). The gate is closed, so every send attempt is refused
-   (no response) and the files stay. Logs keep their existing rule.
+   the transport synchronously (§2.5.1). A metric batch sent here is pre-cutoff, so the wire
+   check (below) answers it with a synthetic 200 before the closed gate is even consulted, and
+   the transport deletes the envelope unsent (`SentryHttpTransport.m:433-447`). Other envelope
+   types aren't metrics, so the wire check forwards them to the gate, which is closed: their
+   send attempts are refused (no response) and the files stay — logs keep their existing rule.
+   Step 5 sweeps any metric envelope this flush didn't reach.
 5. Sweep (`deleteMetricEnvelopes`): every file in `io.sentry/*/envelopes/` that deserializes
    to an envelope with a `trace_metric` item is removed with ReportsKit's
    `removeItem`/`remove` (absence counts as success; the result is checked). Most of the time

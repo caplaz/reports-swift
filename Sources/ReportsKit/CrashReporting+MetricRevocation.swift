@@ -29,9 +29,13 @@ extension CrashReporting {
     }
 
     /// Hands the SDK's metric (and log) batch to the transport synchronously before waiting
-    /// (`SentryClient.m:673-682`, `TelemetryBuffer.swift:76-83`); with the gate closed every
-    /// send attempt is refused and the files stay. The wait is bounded and not needed for
-    /// correctness (spec §2.5.2).
+    /// (`SentryClient.m:673-682`, `TelemetryBuffer.swift:76-83`). A pre-cutoff metric batch
+    /// sent here hits the wire check first and gets a synthetic 200, so the transport deletes
+    /// it unsent (`SentryHttpTransport.m:433-447`) without the closed gate ever being
+    /// consulted; other envelope types (not metrics) do reach the gate, which is closed, so
+    /// their send attempts are refused and the files stay. The wait is bounded and not needed
+    /// for correctness (spec §2.5.2); `deleteMetricEnvelopes` right after sweeps up anything
+    /// this didn't reach.
     private static func forwardMetricBuffer() {
         guard SentrySDK.isEnabled else { return }
         SentrySDK.flush(timeout: 1)
