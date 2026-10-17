@@ -1,3 +1,4 @@
+import Sentry
 import Testing
 @testable import ReportsKit
 
@@ -50,5 +51,25 @@ import Testing
         #expect(metric.kind == .counter)
         #expect(metric.unit == .none)
         #expect(metric.attributes == ["level": ["warning", "critical"]])
+    }
+
+    @Test func unitsMapToSentryUnits() {
+        #expect(Metric("t.a", kind: .counter).sentryUnit == nil)
+        #expect(Metric("t.b", kind: .distribution, unit: .millisecond).sentryUnit == .millisecond)
+        #expect(Metric("t.c", kind: .distribution, unit: .second).sentryUnit == .second)
+        #expect(Metric("t.d", kind: .gauge, unit: .byte).sentryUnit == .byte)
+        #expect(Metric("t.e", kind: .gauge, unit: .percent).sentryUnit == .percent)
+        #expect(Metric("t.f", kind: .gauge, unit: .ratio).sentryUnit == .ratio)
+        #expect(Metric("t.g", kind: .gauge).sentryUnit == nil)
+    }
+
+    @Test func durationsConvertToTheMetricUnit() {
+        #expect(Metric("t.ms", kind: .distribution, unit: .millisecond).value(of: .milliseconds(1_500)) == 1_500)
+        #expect(Metric("t.s", kind: .distribution, unit: .second).value(of: .milliseconds(1_500)) == 1.5)
+    }
+
+    @Test func outcomeOfAnError() {
+        #expect(CrashReporting.outcome(of: CancellationError()) == "cancelled")
+        #expect(CrashReporting.outcome(of: NSError(domain: "t", code: 1)) == "failure")
     }
 }

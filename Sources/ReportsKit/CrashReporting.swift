@@ -26,6 +26,7 @@ public enum CrashReporting {
     nonisolated(unsafe) static var testOptionsOverride: ((Options) -> Void)?
     nonisolated(unsafe) static var logThrottle = LogThrottle()
     nonisolated(unsafe) static var forwardBudget = ForwardBudget()
+    nonisolated(unsafe) static var metricBudget = MetricBudget()
     /// `environmentResolver`'s result, once it returns. sentry-cocoa 9.24.0's log scope
     /// applier (`TelemetryScopeApplier.addDefaultAttributes`) sets a log's `sentry.environment`
     /// attribute from `Options.environment` captured at `start`, not from the scope — so
@@ -236,6 +237,13 @@ public enum CrashReporting {
         return configuration
     }
 
+    /// Whether a metric may be recorded now: started, `metricsEnabled`, consent on, SDK running.
+    static func canRecordMetric() -> Bool {
+        guard let configuration = lock.withLock({ Self.configuration }), configuration.metricsEnabled,
+              ConsentGate.shared.isEnabled, SentrySDK.isEnabled else { return false }
+        return true
+    }
+
     static func makeEvent(
         error: any Error, operation: Operation, describe: (any Error) -> String, detail: String? = nil
     ) -> Event {
@@ -398,6 +406,10 @@ public enum CrashReporting {
         // events (with their URLs).
         options.enableCaptureFailedRequests = false
         options.sendClientReports = false
+        // Metric batches are envelopes too (one per ≤ 5 s of activity). With the default 30, a
+        // few minutes offline would evict queued handled errors, logs and sessions (oldest first,
+        // `SentryFileManager.handleEnvelopesLimit`) (metrics spec §6).
+        options.maxCacheItems = 100
         // Collection-time profile marker (spec §3.3). On the initial scope, so it is in place
         // before any integration installs: SentryCrash snapshots it into every crash report and
         // stored app hangs carry it from detection. `beforeSend` reads it back.
@@ -405,9 +417,9 @@ public enum CrashReporting {
             scope.setTag(value: profile.rawValue, key: CrashReportSanitizer.profileTagKey)
             return scope
         }
-        // Metrics (counters/gauges/distributions) only in the diagnostic profile. ReportsKit
-        // has no metrics producer yet; the gate below still applies to any future one.
-        options.enableMetrics = profile == .diagnostic
+        // Metrics in both profiles (metrics spec decision 1); only ReportsKit's own declared
+        // metrics pass `beforeSendMetric` below. sentry-cocoa's default is on.
+        options.enableMetrics = configuration.metricsEnabled
         options.enableLogs = configuration.logsEnabled
         #if os(iOS)
         // UIKit-only options in sentry-cocoa 9.24.0 (absent from the macOS slice).
@@ -463,10 +475,15 @@ public enum CrashReporting {
             CrashReportSanitizer.sanitize(span: span)
             return span
         }
-        if profile == .diagnostic {
-            options.beforeSendMetric = { metric in
-                ConsentGate.shared.isEnabled && currentSettingProfile() == .diagnostic ? metric : nil
-            }
+        // Runs synchronously on the recording thread after scope application
+        // (`SentryMetricsIntegration.swift:44-78`): the live gate and the pending metric are
+        // authoritative, so no consent marker is needed (metrics spec §4.1).
+        options.beforeSendMetric = { metric in
+            guard ConsentGate.shared.isEnabled else { return nil }
+            let environment = lock.withLock { resolvedEnvironment }
+            return CrashReportSanitizer.sanitize(
+                metric: metric, expected: PendingMetric.current, environment: environment,
+                profile: PrivacyProfile.mostPrivate(profile, currentSettingProfile()))
         }
         testOptionsOverride?(options)
     }
@@ -489,6 +506,7 @@ public enum CrashReporting {
     /// the network stubbed.
     static func resetForTesting() {
         forwardQueue.sync {}   // no forwarded log from the previous test may reach the next SDK
+        metricQueue.sync {}   // likewise for metrics
         ConsentSessionTracker.shared.resetForTesting()
         TraceConsent.shared.resetForTesting()
         beforeConsentMarkerRemovedForTesting = nil
@@ -507,5 +525,6 @@ public enum CrashReporting {
         preferenceDefaults = .standard
         logThrottle = LogThrottle()
         forwardBudget = ForwardBudget()
+        metricBudget = MetricBudget()
     }
 }
