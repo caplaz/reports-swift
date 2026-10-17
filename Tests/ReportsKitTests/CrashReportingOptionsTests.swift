@@ -47,4 +47,36 @@ import Testing
         #expect(options.enableUncaughtNSExceptionReporting == true)
     }
     #endif
+
+    private static func configuration() -> CrashReportingConfiguration {
+        CrashReportingConfiguration(
+            dsn: "https://k@reports.example.com/1", releaseName: "r", environment: "e",
+            cacheDirectory: URL(fileURLWithPath: "/tmp/x"), describeError: TestErrors.describe)
+    }
+
+    @Test func strictEnablesSessionsButNotMetrics() {
+        let options = Options()
+        CrashReporting.apply(Self.configuration(), to: options)
+        #expect(options.enableAutoSessionTracking == false)   // ConsentSessionTracker drives sessions
+        #expect(options.enableMetrics == false)
+        #expect(options.beforeSendMetric == nil)
+        #expect(options.sendDefaultPii == false)
+        // Collection-time marker: on the scope before any integration installs.
+        #expect(options.initialScope(Scope()).tags == ["report.profile": "strict"])
+    }
+
+    @Test func diagnosticEnablesSessionsAndGatedMetrics() {
+        let options = Options()
+        CrashReporting.apply(Self.configuration(), profile: .diagnostic, to: options)
+        #expect(options.enableAutoSessionTracking == false)
+        #expect(options.enableMetrics == true)
+        #expect(options.beforeSendMetric != nil)
+        #expect(options.sendDefaultPii == false)
+        #expect(options.initialScope(Scope()).tags == ["report.profile": "diagnostic"])
+        #expect(options.enableCaptureFailedRequests == false)
+        #if os(iOS)
+        #expect(options.attachScreenshot == false)
+        #expect(options.attachViewHierarchy == false)
+        #endif
+    }
 }

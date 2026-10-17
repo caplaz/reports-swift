@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.0 — 2026-10-16
+
+### Added
+
+- Privacy profiles: `CrashReporting.PrivacyProfile` (`.strict`, the default, and `.diagnostic`) and `CrashReporting.activeProfile`. The profile is chosen at SDK start from the stored settings: `.diagnostic` only when the stored "Send crash reports" and the new "Share detailed diagnostics" (`CrashReportingPreference.isDetailedDiagnosticsEnabled`, `CrashReporting.setDetailedDiagnosticsEnabled`, default off) are both on, whatever `enabled` the app passes to `start`.
+- Turning "Share detailed diagnostics" off applies immediately: the process is `.strict` from then on (events, breadcrumbs and logs sanitized as strict, no `user.id`, `forwardLog` stops, crash reports collected afterwards tagged `strict`), even if it is turned back on; sessions keep their `did` until the next launch and already-queued reports are still delivered. Turning it on applies at the next SDK start.
+- `.diagnostic` sends the error's own text and file/URL user info in handled errors (exception value and `report.error.detail` on error logs), keeps exception reasons, frame file names and full image paths, keeps breadcrumb messages, attaches the installation ID as `user.id`, and sends sessions with the installation ID. It also enables the metrics ingestion path behind the consent gate (`beforeSendMetric`); ReportsKit has no metrics producer yet, so nothing is sent either way today. Device name, IP, screenshots and view hierarchy are never sent.
+- `CrashReporting.forwardLog(_:category:message:)`: forwards app log lines in `.diagnostic` only, with `report.category`, budgeted (identical line once per 10 s, 120/min, 5,000/process, `report.dropped` count) and emitted off the caller's thread.
+- Event tag `report.profile`: set on the scope at every start (so stored crash and hang reports keep the profile they were collected under) and rewritten to the profile actually applied before sending.
+
+### Changed
+
+- Release-health sessions are now on in both profiles. In `.strict`, ReportsKit deletes sentry-cocoa's `INSTALLATION` file before every start, so each launch's sessions carry a new random `did` and no identifier is shared across launches (timing could still correlate adjacent launches) (Crash Free Sessions is accurate; Crash Free Users counts launches).
+- Going from `.diagnostic` back to `.strict` deletes everything queued but not yet sent before the SDK starts; events collected by an earlier launch (crashes, hangs, at any level) are sanitized with the more private of their own `report.profile` tag and the current profile, untagged ones as `.strict`.
+- Whole-cache deletions (reporting off at launch, or a downgrade) are recorded as pending until they succeed; the SDK does not start while one is pending.
+- Release-health sessions follow consent: ReportsKit starts and ends them itself (auto session tracking off) with sentry-cocoa's 30 s background grace period (`Options.sessionTrackingIntervalMillis`: a shorter absence keeps the session, a longer one ends it and starts a new one, termination ends it), closes an earlier launch's unfinished session (as exited at the time the app left the foreground if it died in the background, else abnormal), and turning reporting off ends the session at once, pauses app-hang tracking for the rest of the process and marks the scope `report.consent=off` so nothing collected while off is ever sent.
+- Tracing (`tracesSampleRate`) is now gated by consent independently of profile, through `tracesSampler`: a transaction is sampled (the SDK rolls `tracesSampleRate` and reports it as `sample_rate`) only while reporting is on, and `beforeSend` drops one that spans or finishes during an opted-out interval even if it is processed after re-enable. A transaction created with an explicit `sampled` decision skips `tracesSampler` and is therefore dropped (0.2.2 sent it).
+- `start`, `setEnabled` and `setDetailedDiagnosticsEnabled` must be called on the main thread and trap otherwise (`dispatchPrecondition`). A `setEnabled` call made from inside a running transition (e.g. a synchronous observer) is applied after it, so overlapping calls end in the last call's state.
+
 ## 0.2.2 — 2026-10-16
 
 ### Fixed

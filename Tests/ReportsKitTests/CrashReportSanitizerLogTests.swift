@@ -144,4 +144,53 @@ import Testing
         #expect(result.ran)
         #expect(result.value == nil)
     }
+
+    static let forwarded = ExpectedLog(
+        level: .error, body: "session start failed: /Users/jane/Client Smith.cube",
+        attributes: ["report.source": "app-log", "report.category": "SDI", "report.dropped": "3"],
+        timestamp: Date(timeIntervalSince1970: 1_000))
+
+    @Test func strictRejectsForwardedLogsEvenWhenPending() {
+        #expect(CrashReportSanitizer.sanitize(log: Self.sdkEnriched(Self.forwarded), expected: Self.forwarded) == nil)
+        #expect(CrashReportSanitizer.sanitize(
+            log: Self.sdkEnriched(Self.forwarded), expected: Self.forwarded, profile: .strict) == nil)
+    }
+
+    @Test func diagnosticKeepsForwardedLogWithCategoryAndInstallationID() throws {
+        let sanitized = try #require(CrashReportSanitizer.sanitize(
+            log: Self.sdkEnriched(Self.forwarded), expected: Self.forwarded, profile: .diagnostic))
+        let values = Self.stringValues(sanitized)
+        #expect(sanitized.body == "session start failed: /Users/jane/Client Smith.cube")
+        #expect(values["report.source"] == "app-log")
+        #expect(values["report.category"] == "SDI")
+        #expect(values["report.dropped"] == "3")
+        #expect(values["user.id"] == "installation-id-123")
+        for key in ["user.name", "user.email", "device.name", "file.path", "sentry.replay_id",
+                    "sentry.message.template", "sentry.message.parameter.0"] {
+            #expect(values[key] == nil, "kept \(key)")
+        }
+        #expect(sanitized.timestamp == Date(timeIntervalSince1970: 1_000))
+    }
+
+    @Test func strictStripsDiagnosticOnlyAttributesFromReportsKitLogs() throws {
+        let expected = ExpectedLog(level: .error, body: "exportSave NSError code=260", attributes: [
+            "report.source": "reportskit", "report.op": "exportSave", "report.error": "NSError code=260",
+            "report.error.detail": "/Users/jane/x", "report.category": "SDI"
+        ])
+        let sanitized = try #require(CrashReportSanitizer.sanitize(log: Self.sdkEnriched(expected), expected: expected))
+        let keys = Set(Self.stringValues(sanitized).keys)
+        #expect(keys.isSubset(of: CrashReportSanitizer.allowedLogAttributeKeys))
+        #expect(!keys.contains("report.error.detail"))
+        #expect(!keys.contains("user.id"))
+    }
+
+    @Test func diagnosticKeepsErrorDetailOnReportsKitLogs() throws {
+        let expected = ExpectedLog(level: .error, body: "exportSave NSError code=260", attributes: [
+            "report.source": "reportskit", "report.op": "exportSave", "report.error": "NSError code=260",
+            "report.error.detail": "/Users/jane/x"
+        ])
+        let sanitized = try #require(CrashReportSanitizer.sanitize(
+            log: Self.sdkEnriched(expected), expected: expected, profile: .diagnostic))
+        #expect(Self.stringValues(sanitized)["report.error.detail"] == "/Users/jane/x")
+    }
 }

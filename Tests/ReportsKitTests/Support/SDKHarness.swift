@@ -38,20 +38,56 @@ enum SDKHarness {
         mode: RecordingURLProtocol.Mode = .accept,
         environmentResolver: (@Sendable () async -> String?)? = nil
     ) -> CrashReportingConfiguration {
+        prepare(mode: mode, environmentResolver: environmentResolver, keeping: nil, copyingCacheFrom: nil)
+    }
+
+    /// Simulates a relaunch: same as `reset()`, but keeps the preference suite `defaults`
+    /// (from the previous `reset`) and, when given, copies `source`'s contents into the new,
+    /// fresh cache path. A new path avoids SentryInstallation's static per-path ID cache;
+    /// copying keeps `INSTALLATION`, the stored session and queued envelopes like a real
+    /// relaunch.
+    @MainActor
+    static func reset(keeping defaults: UserDefaults, copyingCacheFrom source: URL? = nil) -> CrashReportingConfiguration {
+        prepare(mode: .accept, environmentResolver: nil, keeping: defaults, copyingCacheFrom: source)
+    }
+
+    @MainActor
+    private static func prepare(
+        mode: RecordingURLProtocol.Mode,
+        environmentResolver: (@Sendable () async -> String?)?,
+        keeping defaults: UserDefaults?,
+        copyingCacheFrom source: URL?
+    ) -> CrashReportingConfiguration {
         _ = registerExitCleanup
-        cleanUpLeftovers()
+        // Close the SDK before touching its files (close() flushes and may write the cache).
         CrashReporting.resetForTesting()
+        let cache = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CrashReportingTests-\(UUID().uuidString)", isDirectory: true)
+        if let source, FileManager.default.fileExists(atPath: source.path) {
+            try? FileManager.default.copyItem(at: source, to: cache)
+        }
+        if defaults != nil {
+            // Keep the suite: clean up only the previous cache directory.
+            let suite = lastSuiteName
+            lastSuiteName = nil
+            cleanUpLeftovers()
+            lastSuiteName = suite
+        } else {
+            cleanUpLeftovers()
+        }
         RecordingURLProtocol.reset(mode: mode)
         RecordingURLProtocol.installBehindConsentProtocol()
-        let suite = "SDKHarness.\(UUID().uuidString)"
-        lastSuiteName = suite
-        CrashReporting.preferenceDefaults = UserDefaults(suiteName: suite)!
+        if let defaults {
+            CrashReporting.preferenceDefaults = defaults
+        } else {
+            let suite = "SDKHarness.\(UUID().uuidString)"
+            lastSuiteName = suite
+            CrashReporting.preferenceDefaults = UserDefaults(suiteName: suite)!
+        }
         CrashReporting.testOptionsOverride = { options in
             options.enableCrashHandler = false   // don't install signal handlers in the test runner
             options.enableAppHangTracking = false
         }
-        let cache = FileManager.default.temporaryDirectory
-            .appendingPathComponent("CrashReportingTests-\(UUID().uuidString)", isDirectory: true)
         lastCacheDirectory = cache
         return CrashReportingConfiguration(
             dsn: dsn, releaseName: "com.example.Test@1.0+1", environment: "test",

@@ -116,4 +116,64 @@ import Testing
         #expect(event.breadcrumbs?.first?.message == nil)
         #expect(event.breadcrumbs?.first?.data?.keys.sorted() == ["screen"])
     }
+
+    @Test func diagnosticKeepsErrorTextAndPathsButNoDeviceIdentity() throws {
+        let source = Self.makeCrashEvent()
+        source.user?.email = "jane@example.com"
+        source.user?.username = "jane"
+        let event = CrashReportSanitizer.sanitize(source, profile: .diagnostic)
+        let appPath = "/Users/jane/Applications/MyApp.app/Contents/MacOS/MyApp"
+
+        let exception = try #require(event.exceptions?.first)
+        #expect(exception.value?.contains("/Users/jane/Documents/Client Smith.cube") == true)
+        #expect(exception.type == "NSInvalidArgumentException")
+        #expect(exception.mechanism?.desc == "file:///Volumes/Work/Client%20Smith")
+        #expect(exception.mechanism?.data?["path"] as? String == "/Users/jane/x.profile")
+        #expect(exception.mechanism?.helpLink == nil)
+
+        let frame = try #require(event.threads?.first?.stacktrace?.frames.first)
+        #expect(frame.fileName == "/Users/jane/src/ExportSession.swift")
+        #expect(frame.package == appPath)
+        #expect(frame.contextLine == nil)
+        #expect(frame.preContext == nil)
+        #expect(frame.postContext == nil)
+        #expect(frame.vars == nil)
+        #expect(event.debugMeta?.first?.codeFile == appPath)
+
+        #expect(event.breadcrumbs?.first?.message == "opened /Users/jane/Client Smith.cube")
+        #expect(event.breadcrumbs?.first?.data?.keys.sorted() == ["screen"])
+
+        #expect(event.user?.userId == "installation-id-123")
+        #expect(event.user?.email == nil)
+        #expect(event.user?.username == nil)
+        #expect(event.serverName == nil)
+        #expect(event.extra == nil)
+        #expect(event.message == nil)
+        #expect(event.error == nil)
+        #expect(event.context?["device"]?["name"] == nil)
+        #expect(event.context?["culture"] == nil)
+        #expect(event.context?["custom"] == nil)
+        #expect(event.context?["app"]?["device_app_hash"] == nil)
+        #expect(event.tags == ["report.op": "exportSave"])
+
+        let output = try Self.json(event)
+        for needle in ["Jane's MacBook Pro", "Janes-MacBook-Pro", "Europe/Rome", "Jane's Mac", "abcdef"] {
+            #expect(!output.contains(needle), "leaked: \(needle)")
+        }
+    }
+
+    @Test func profileTagIsAllowlisted() {
+        let event = Event(level: .error)
+        event.tags = ["report.profile": "diagnostic", "other": "x"]
+        #expect(CrashReportSanitizer.sanitize(event).tags == ["report.profile": "diagnostic"])
+    }
+
+    @Test func consentMarkerIsNeverSent() {
+        for profile in CrashReporting.PrivacyProfile.allCases {
+            let event = Event(level: .error)
+            event.tags = ["report.consent": "off", "report.profile": profile.rawValue]
+            #expect(CrashReportSanitizer.sanitize(event, profile: profile).tags == ["report.profile": profile.rawValue])
+        }
+        #expect(!CrashReportSanitizer.allowedTagKeys.contains(CrashReportSanitizer.consentTagKey))
+    }
 }

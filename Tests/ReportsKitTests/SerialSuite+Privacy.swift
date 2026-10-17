@@ -57,7 +57,7 @@ extension SerialSuite {
         assertNoNeedles(envelopes)
     }
 
-    @MainActor @Test func noUserIdentifierAndNoSessionsAcrossStarts() async throws {
+    @MainActor @Test func noUserIdentifierAcrossStarts() async throws {
         for _ in 0..<2 {
             let config = SDKHarness.reset()
             CrashReporting.start(enabled: true, configuration: config)
@@ -65,7 +65,6 @@ extension SerialSuite {
             await SDKHarness.flush(until: { SDKHarness.delivered("event") })
             let items = try SDKHarness.envelopes().flatMap(\.items)
             #expect(!items.isEmpty)
-            #expect(!items.contains { $0.type == "session" })
             for item in items where item.type == "event" {
                 #expect(item.json?["user"] == nil)
             }
