@@ -26,6 +26,8 @@ public enum CrashReporting {
     nonisolated(unsafe) static var testOptionsOverride: ((Options) -> Void)?
     nonisolated(unsafe) static var logThrottle = LogThrottle()
     nonisolated(unsafe) static var forwardBudget = ForwardBudget()
+    nonisolated(unsafe) static var metricBudget = MetricBudget()
+    nonisolated(unsafe) static var metricRevocation = MetricRevocation()
     /// `environmentResolver`'s result, once it returns. sentry-cocoa 9.24.0's log scope
     /// applier (`TelemetryScopeApplier.addDefaultAttributes`) sets a log's `sentry.environment`
     /// attribute from `Options.environment` captured at `start`, not from the scope — so
@@ -153,10 +155,20 @@ public enum CrashReporting {
             SentrySDK.pauseAppHangTracking()
             // Transactions admitted before this point can't be sent any more (spec §3.2d).
             TraceConsent.shared.setConsented(false)
+            // Metrics recorded before this opt-out are deleted, never sent (metrics spec §4.2).
+            revokePendingMetrics(lock.withLock { Self.configuration })
             return
         }
         let (configuration, started) = lock.withLock { (Self.configuration, sdkStarted) }
         if started && SentrySDK.isEnabled {
+            // Fail closed (metrics spec §4.2 "Sweep"): a pre-opt-out metric envelope that can't
+            // be deleted, or a cache that can't be listed or read, keeps reporting off for this
+            // process; the pending purge empties the cache at the next start (or that start
+            // fails closed, as for any required deletion).
+            guard let configuration, reopenMetrics(configuration) else {
+                CrashReportingPreference.setPendingPurge(true, in: preferenceDefaults)
+                return
+            }
             beforeConsentMarkerRemovedForTesting?()
             SentrySDK.configureScope { $0.removeTag(key: CrashReportSanitizer.consentTagKey) }
             // App-hang tracking stays paused and `report.hangs=off` stays on the scope for the
@@ -236,6 +248,17 @@ public enum CrashReporting {
         return configuration
     }
 
+    /// Whether a metric may be recorded now: started, `metricsEnabled`, consent on, SDK started
+    /// by ReportsKit. The hot path of `count` and `Tally.add`, so it takes only ReportsKit's own
+    /// locks: `sdkStarted` (set after `SentrySDK.start`, cleared by `start` when no SDK is
+    /// running, by a failed `startSDK` and by `resetForTesting`) stands in for
+    /// `SentrySDK.isEnabled`, which takes the SDK's global lock. The emission on `metricQueue`
+    /// still checks `SentrySDK.isEnabled`, so a metric admitted after the app closed the SDK
+    /// itself is dropped there.
+    static func canRecordMetric() -> Bool {
+        lock.withLock { sdkStarted && configuration?.metricsEnabled == true } && ConsentGate.shared.isEnabled
+    }
+
     static func makeEvent(
         error: any Error, operation: Operation, describe: (any Error) -> String, detail: String? = nil
     ) -> Event {
@@ -275,6 +298,7 @@ public enum CrashReporting {
             return
         }
         CrashReportingPreference.setLastProfile(requested, in: preferenceDefaults)
+        metricRevocation.reopen()
         lock.withLock {
             startedProfile = requested
             detailedDiagnosticsRevoked = false
@@ -322,6 +346,15 @@ public enum CrashReporting {
         if downgrade || CrashReportingPreference.hasPendingPurge(in: preferenceDefaults) {
             guard purgeCache(directory) else { return false }
         }
+        // Metric envelopes left by a process that opted out (metrics spec §4.2): nothing is
+        // sending yet, so this sweep is complete.
+        if CrashReportingPreference.hasPendingMetricSweep(in: preferenceDefaults) {
+            guard deleteMetricEnvelopes(in: directory) else {
+                CrashReportingPreference.setPendingPurge(true, in: preferenceDefaults)
+                return false
+            }
+            CrashReportingPreference.setPendingMetricSweep(false, in: preferenceDefaults)
+        }
         let rotateID = profile == .strict || previous == .strict
         guard rotateID else { return true }
         return remove(directory.appendingPathComponent(installationFileName))
@@ -335,11 +368,12 @@ public enum CrashReporting {
         CrashReportingPreference.setPendingPurge(true, in: preferenceDefaults)
         guard remove(directory) else { return false }
         CrashReportingPreference.setPendingPurge(false, in: preferenceDefaults)
+        CrashReportingPreference.setPendingMetricSweep(false, in: preferenceDefaults)
         return true
     }
 
     /// `true` when `url` is gone afterwards: deleted now, or already absent.
-    private static func remove(_ url: URL) -> Bool {
+    static func remove(_ url: URL) -> Bool {
         do {
             try removeItem(url)
         } catch CocoaError.fileNoSuchFile {
@@ -398,6 +432,10 @@ public enum CrashReporting {
         // events (with their URLs).
         options.enableCaptureFailedRequests = false
         options.sendClientReports = false
+        // Metric batches are envelopes too (one per ≤ 5 s of activity). With the default 30, a
+        // few minutes offline would evict queued handled errors, logs and sessions (oldest first,
+        // `SentryFileManager.handleEnvelopesLimit`) (metrics spec §6).
+        options.maxCacheItems = 100
         // Collection-time profile marker (spec §3.3). On the initial scope, so it is in place
         // before any integration installs: SentryCrash snapshots it into every crash report and
         // stored app hangs carry it from detection. `beforeSend` reads it back.
@@ -405,9 +443,9 @@ public enum CrashReporting {
             scope.setTag(value: profile.rawValue, key: CrashReportSanitizer.profileTagKey)
             return scope
         }
-        // Metrics (counters/gauges/distributions) only in the diagnostic profile. ReportsKit
-        // has no metrics producer yet; the gate below still applies to any future one.
-        options.enableMetrics = profile == .diagnostic
+        // Metrics in both profiles (metrics spec decision 1); only ReportsKit's own declared
+        // metrics pass `beforeSendMetric` below. sentry-cocoa's default is on.
+        options.enableMetrics = configuration.metricsEnabled
         options.enableLogs = configuration.logsEnabled
         #if os(iOS)
         // UIKit-only options in sentry-cocoa 9.24.0 (absent from the macOS slice).
@@ -463,10 +501,16 @@ public enum CrashReporting {
             CrashReportSanitizer.sanitize(span: span)
             return span
         }
-        if profile == .diagnostic {
-            options.beforeSendMetric = { metric in
-                ConsentGate.shared.isEnabled && currentSettingProfile() == .diagnostic ? metric : nil
-            }
+        // Runs synchronously on the recording thread after scope application
+        // (`SentryMetricsIntegration.swift:44-78`): the live gate and the pending metric are
+        // authoritative, so no consent marker is needed (metrics spec §4.1).
+        options.beforeSendMetric = { metric in
+            guard ConsentGate.shared.isEnabled, let pending = PendingMetric.current,
+                  !metricRevocation.isRevoked(pending.timestamp) else { return nil }
+            let environment = lock.withLock { resolvedEnvironment }
+            return CrashReportSanitizer.sanitize(
+                metric: metric, expected: pending, environment: environment,
+                profile: PrivacyProfile.mostPrivate(profile, currentSettingProfile()))
         }
         testOptionsOverride?(options)
     }
@@ -489,6 +533,7 @@ public enum CrashReporting {
     /// the network stubbed.
     static func resetForTesting() {
         forwardQueue.sync {}   // no forwarded log from the previous test may reach the next SDK
+        metricQueue.sync {}   // likewise for metrics
         ConsentSessionTracker.shared.resetForTesting()
         TraceConsent.shared.resetForTesting()
         beforeConsentMarkerRemovedForTesting = nil
@@ -503,9 +548,13 @@ public enum CrashReporting {
             detailedDiagnosticsRevoked = false
         }
         testOptionsOverride = nil
-        removeItem = { try FileManager.default.removeItem(at: $0) }
+        resetFileSeamsForTesting()
         preferenceDefaults = .standard
         logThrottle = LogThrottle()
         forwardBudget = ForwardBudget()
+        metricBudget = MetricBudget()
+        metricRevocation = MetricRevocation()
+        MetricRevocation.wireCheckEnabledForTesting = true
+        ConsentURLProtocol.afterVerdictForTesting = nil
     }
 }

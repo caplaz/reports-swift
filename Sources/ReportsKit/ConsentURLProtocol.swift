@@ -3,10 +3,21 @@ import Foundation
 /// First protocol of the URLSession handed to Sentry (`Options.urlSession`). Requests are
 /// forwarded through an inner session only when `ConsentGate.shared` admits them. A refused
 /// or revoked request fails with no HTTP response, which makes sentry-cocoa 9.24.0 keep the
-/// envelope on disk instead of sending or deleting it.
+/// envelope on disk instead of sending or deleting it. A metric batch admitted before an
+/// opt-out is answered with 200 and never forwarded (`MetricRevocation.checkedVerdict`). The
+/// verdict is bound to its revocation epoch and re-validated atomically with gate admission
+/// (`ConsentGate.admit(while:_:)`).
 final class ConsentURLProtocol: URLProtocol, @unchecked Sendable {
     /// Tests swap this for a configuration whose protocol records instead of networking.
     nonisolated(unsafe) static var innerConfiguration: URLSessionConfiguration = .ephemeral
+
+    /// Wire verdict + admission attempts per request before refusing. Each `.stale` retry needs
+    /// a whole opt-out between verdict and admission, so a second attempt almost always settles.
+    static let maxDecisions = 3
+
+    /// Test seam: runs on the loading thread after each wire verdict, before gate admission,
+    /// with the request body and the verdict. Reset by `CrashReporting.resetForTesting()`.
+    nonisolated(unsafe) static var afterVerdictForTesting: ((Data, MetricRevocation.Verdict) -> Void)?
 
     private final class TaskBox: @unchecked Sendable {
         var task: URLSessionTask?
@@ -52,8 +63,10 @@ final class ConsentURLProtocol: URLProtocol, @unchecked Sendable {
         }
         let session = URLSession(configuration: Self.innerConfiguration)
         let box = self.box
-        let task = ConsentGate.shared.admit {
-            let task = session.dataTask(with: forwarded) { [weak self] data, response, error in
+        // Weak at the outer closure: the completion handler below reaches `self` through it
+        // (a weak capture only in the inner closure would make this one capture `self` strongly).
+        let makeTask = { [weak self] () -> URLSessionTask in
+            let task = session.dataTask(with: forwarded) { data, response, error in
                 defer { session.finishTasksAndInvalidate() }
                 if let task = box.task { ConsentGate.shared.finished(task) }
                 guard let self else { return }
@@ -72,7 +85,52 @@ final class ConsentURLProtocol: URLProtocol, @unchecked Sendable {
             box.task = task
             return task
         }
-        guard let task else {
+        let body = forwarded.httpBody ?? Data()
+        var admitted: URLSessionTask?
+        decision: for _ in 0..<Self.maxDecisions {
+            // Metrics admitted before an opt-out are never delivered (metrics spec §4.2): answer
+            // a pre-cutoff metric batch with 200 so sentry-cocoa deletes it unsent
+            // (`SentryHttpTransport.m:433-447`); refuse an unreadable body that may hold a
+            // metric (kept on disk). An unreadable body without one takes the normal gate path.
+            let revocation = CrashReporting.metricRevocation
+            let checked = revocation.checkedVerdict(forRequestBody: body)
+            Self.afterVerdictForTesting?(body, checked.verdict)
+            switch checked.verdict {
+            case .forward:
+                break
+            case .swallow:
+                session.invalidateAndCancel()
+                deliver { [weak self] in
+                    guard let self, let url = self.request.url,
+                          let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: nil)
+                    else { return }
+                    self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+                    self.client?.urlProtocolDidFinishLoading(self)
+                }
+                return
+            case .refuse:
+                session.invalidateAndCancel()
+                deliver { [weak self] in
+                    guard let self else { return }
+                    self.client?.urlProtocol(self, didFailWithError: URLError(.cannotDecodeRawData))
+                }
+                return
+            }
+            // Admitted only if no opt-out started a new revocation epoch since the verdict,
+            // checked under the gate's lock (`ConsentGate.admit(while:_:)`).
+            switch ConsentGate.shared.admit(while: { revocation.isCurrent(epoch: checked.epoch) }, makeTask) {
+            case .admitted(let task):
+                admitted = task
+                break decision
+            case .closed:
+                break decision
+            case .stale:
+                continue decision   // opted out (and back in) since the verdict: decide again
+            }
+        }
+        // Closed gate, or consent kept changing under every decision: refuse (fail closed; the
+        // envelope stays on disk).
+        guard let task = admitted else {
             session.invalidateAndCancel()
             deliver { [weak self] in
                 guard let self else { return }

@@ -50,4 +50,13 @@ import Testing
         #expect(!CrashReportingPreference.hasPendingPurge(in: defaults))
         #expect(defaults.object(forKey: CrashReportingPreference.pendingPurgeKey) == nil)
     }
+
+    @Test func pendingMetricSweepDefaultsToNoneAndRoundTrips() {
+        let defaults = freshDefaults()
+        #expect(!CrashReportingPreference.hasPendingMetricSweep(in: defaults))
+        CrashReportingPreference.setPendingMetricSweep(true, in: defaults)
+        #expect(CrashReportingPreference.hasPendingMetricSweep(in: defaults))
+        CrashReportingPreference.setPendingMetricSweep(false, in: defaults)
+        #expect(defaults.object(forKey: CrashReportingPreference.pendingMetricSweepKey) == nil)
+    }
 }

@@ -15,6 +15,9 @@ public struct CrashReportingConfiguration: Sendable {
     public var tracesSampleRate: Double
     /// Whether `CrashReporting.log` sends structured logs (`Options.enableLogs`). Default `true`.
     public var logsEnabled: Bool
+    /// Whether `CrashReporting.count`/`distribution`/`gauge` send metrics
+    /// (`Options.enableMetrics`), in both profiles. Default `true`.
+    public var metricsEnabled: Bool
     /// The **only** error text that leaves the device for a handled error (`report.error`
     /// tag, exception type, fingerprint; log body and `report.error` log attribute). It must
     /// never include paths, file names, URLs, `localizedDescription`, `userInfo` values or any
@@ -33,6 +36,7 @@ public struct CrashReportingConfiguration: Sendable {
         cacheDirectory: URL,
         tracesSampleRate: Double = 0.05,
         logsEnabled: Bool = true,
+        metricsEnabled: Bool = true,
         describeError: @escaping @Sendable (any Error) -> String,
         environmentResolver: (@Sendable () async -> String?)? = nil
     ) {
@@ -42,6 +46,7 @@ public struct CrashReportingConfiguration: Sendable {
         self.cacheDirectory = cacheDirectory
         self.tracesSampleRate = tracesSampleRate
         self.logsEnabled = logsEnabled
+        self.metricsEnabled = metricsEnabled
         self.describeError = describeError
         self.environmentResolver = environmentResolver
     }
@@ -53,6 +58,7 @@ public struct CrashReportingConfiguration: Sendable {
         bundle: Bundle = .main,
         environment: String = "production",
         logsEnabled: Bool = true,
+        metricsEnabled: Bool = true,
         describeError: @escaping @Sendable (any Error) -> String,
         environmentResolver: (@Sendable () async -> String?)? = nil
     ) -> CrashReportingConfiguration? {
@@ -63,6 +69,7 @@ public struct CrashReportingConfiguration: Sendable {
             environment: environment,
             cacheDirectory: defaultCacheDirectory(),
             logsEnabled: logsEnabled,
+            metricsEnabled: metricsEnabled,
             describeError: describeError,
             environmentResolver: environmentResolver
         )

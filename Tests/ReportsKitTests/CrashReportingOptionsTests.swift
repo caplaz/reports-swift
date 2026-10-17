@@ -19,8 +19,11 @@ import Testing
         // URLs) into events.
         #expect(options.enableCaptureFailedRequests == false)
         #expect(options.sendClientReports == false)
-        // CrashReporting never calls the Metrics API; don't ship an unused ingestion path.
-        #expect(options.enableMetrics == false)
+        // Metrics in both profiles, gated by beforeSendMetric (spec 2026-10-17 §4).
+        #expect(options.enableMetrics == true)
+        #expect(options.beforeSendMetric != nil)
+        // Room for offline metric batches without evicting queued reports (spec §6).
+        #expect(options.maxCacheItems == 100)
     }
 
     @Test func mapsLogsEnabledToEnableLogsAndInstallsBeforeSendLog() {
@@ -54,12 +57,12 @@ import Testing
             cacheDirectory: URL(fileURLWithPath: "/tmp/x"), describeError: TestErrors.describe)
     }
 
-    @Test func strictEnablesSessionsButNotMetrics() {
+    @Test func strictEnablesSessionsAndGatedMetrics() {
         let options = Options()
         CrashReporting.apply(Self.configuration(), to: options)
         #expect(options.enableAutoSessionTracking == false)   // ConsentSessionTracker drives sessions
-        #expect(options.enableMetrics == false)
-        #expect(options.beforeSendMetric == nil)
+        #expect(options.enableMetrics == true)
+        #expect(options.beforeSendMetric != nil)
         #expect(options.sendDefaultPii == false)
         // Collection-time marker: on the scope before any integration installs.
         #expect(options.initialScope(Scope()).tags == ["report.profile": "strict"])
@@ -78,5 +81,21 @@ import Testing
         #expect(options.attachScreenshot == false)
         #expect(options.attachViewHierarchy == false)
         #endif
+    }
+
+    @Test func metricsEnabledFalseTurnsTheIntegrationOff() {
+        for profile in CrashReporting.PrivacyProfile.allCases {
+            let configuration = CrashReportingConfiguration(
+                dsn: "https://k@reports.example.com/1", releaseName: "r", environment: "e",
+                cacheDirectory: URL(fileURLWithPath: "/tmp/x"), metricsEnabled: false,
+                describeError: TestErrors.describe)
+            let options = Options()
+            CrashReporting.apply(configuration, profile: profile, to: options)
+            #expect(options.enableMetrics == false)
+        }
+    }
+
+    @Test func metricsAreEnabledByDefault() {
+        #expect(Self.configuration().metricsEnabled)
     }
 }

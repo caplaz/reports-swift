@@ -187,6 +187,43 @@ enum CrashReportSanitizer {
         return log
     }
 
+    // MARK: Metrics
+
+    /// SDK attributes a metric may keep — the strict log allowlist, in both profiles. Never
+    /// `user.*` (the scope applier adds the installation ID as `user.id` whenever it is cached;
+    /// metrics never carry it, spec decision 5), `sentry.replay_id` or scope attributes.
+    static let allowedMetricSDKAttributeKeys: Set<String> = allowedLogSDKAttributeKeys
+
+    /// Keeps only the metric ReportsKit is emitting on this thread right now (`expected`, same
+    /// name, value and unit); rebuilds its attributes from the SDK allowlist plus the
+    /// declaration-filtered app attributes; sets the admission timestamp. Strict replaces the
+    /// process-wide propagation `traceId` with a fresh random one and removes `spanId`, so a
+    /// metric can't be linked to events or transactions through its trace (spec §4); metrics
+    /// in one SDK batch still share an envelope. Diagnostic keeps both IDs: its metrics share
+    /// the propagation trace ID with events that carry `user.id`. Returns `nil` (drop) for
+    /// anything else.
+    static func sanitize(
+        metric: SentryMetric, expected: ExpectedMetric?, environment: String? = nil, profile: Profile = .strict
+    ) -> SentryMetric? {
+        guard let expected, metric.name == expected.name, metric.value == expected.value,
+              metric.unit == expected.unit else { return nil }
+        var result = metric
+        var attributes = metric.attributes.filter { allowedMetricSDKAttributeKeys.contains($0.key) }
+        for (key, value) in expected.attributes {
+            attributes[key] = .string(value)
+        }
+        if let environment {
+            attributes[logEnvironmentKey] = .string(environment)
+        }
+        result.attributes = attributes
+        result.timestamp = expected.timestamp
+        if profile == .strict {
+            result.traceId = SentryId()
+            result.spanId = nil
+        }
+        return result
+    }
+
     static func keepsDescription(operation: String) -> Bool {
         operation.hasPrefix("app.start") || describedSpanOps.contains(operation)
     }

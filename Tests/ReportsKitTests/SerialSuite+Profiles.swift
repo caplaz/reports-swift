@@ -758,10 +758,14 @@ extension SerialSuite {
         let bound = SentrySDK.startTransaction(name: "bound", operation: "test", bindToScope: true)
         started.finish()                     // finishes while a different transaction is bound
         bound.finish()
-        #expect(await SDKHarness.flush(until: { SDKHarness.delivered("transaction") }))
-        let names = try SDKHarness.envelopes().flatMap(\.items).filter { $0.type == "transaction" }
-            .compactMap(\.json).compactMap { $0["transaction"] as? String }
-        #expect(Set(names) == ["after", "bound"])
+        // The two transactions travel in separate envelopes and can arrive in separate drains,
+        // so wait (bounded) until both expected names are in before asserting the exact set.
+        let deliveredNames = {
+            ((try? SDKHarness.envelopes()) ?? []).flatMap(\.items).filter { $0.type == "transaction" }
+                .compactMap(\.json).compactMap { $0["transaction"] as? String }
+        }
+        #expect(await SDKHarness.flush(until: { Set(deliveredNames()).isSuperset(of: ["after", "bound"]) }))
+        #expect(Set(deliveredNames()) == ["after", "bound"])
     }
 
     // Regression (review): tracing works right after a normal enabled launch.
