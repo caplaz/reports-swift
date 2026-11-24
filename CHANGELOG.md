@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `CrashReporting.Screen` and `CrashReporting.screen(_:)`: a screen breadcrumb trail. Declare each screen once as a static identifier written in source (like `Operation`), then call `CrashReporting.screen(.settings)` where the screen opens. The breadcrumb is `navigation` / `screen` with the name as its only data (`screen`), in both profiles (the sanitizer already allows that key and strips the message). A no-op before `start`, while reporting is off, or before the SDK and the consent gate are on, so an opted-out user records nothing.
+
+### Changed
+
+- `Options.maxBreadcrumbs` is 20 (was the SDK default 100).
+
 ## 0.3.0 — 2026-10-17
 
 First stable release of privacy profiles (0.3.0-beta.1) and anonymous application metrics (0.3.0-beta.2); no changes since 0.3.0-beta.2. Verified end to end on TestFlight: detailed diagnostics (forwarded logs, stable installation ID), immediate downgrade when detailed diagnostics is turned off, metrics with only allowlisted attributes, and nothing delivered from an opted-out interval.

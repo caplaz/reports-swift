@@ -111,6 +111,21 @@ do {
 }
 ```
 
+### Screen breadcrumbs
+
+Declare the app's screens once, like operations, and mark each when it opens:
+
+```swift
+extension CrashReporting.Screen {
+    static let home = Self("home")
+    static let settings = Self("settings")
+}
+
+CrashReporting.screen(.settings)
+```
+
+A report carries the last 20 screens as breadcrumbs with only the screen name (`screen` data key); no message, no other data. Use a fixed identifier written in source — never a title, a name or an amount. Marking a screen is a no-op while reporting is off.
+
 `capture` sends only the operation and `describeError(error)` — never the error value, its
 description or `userInfo`. It is a no-op before `start`, while reporting is off, or when the
 SDK is not running.

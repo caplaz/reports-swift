@@ -19,6 +19,18 @@ public enum CrashReporting {
         public init(_ rawValue: String) { self.rawValue = rawValue }
     }
 
+    /// A screen of the app, for the breadcrumb trail of a report. Declare each one once, as a
+    /// static identifier written in source code (`Self("settings")`, `Self("scan.check")`), the
+    /// way `Operation` is declared — never user data (a title, a name, an amount).
+    public struct Screen: RawRepresentable, Hashable, Sendable {
+        public let rawValue: String
+        public init(rawValue: String) { self.rawValue = rawValue }
+        public init(_ rawValue: String) { self.rawValue = rawValue }
+    }
+
+    /// The most breadcrumbs a report carries; older ones fall off.
+    static let maxBreadcrumbs: UInt = 20
+
     private static let lock = NSLock()
     nonisolated(unsafe) private static var configuration: CrashReportingConfiguration?
     nonisolated(unsafe) private static var sdkStarted = false
@@ -240,6 +252,19 @@ public enum CrashReporting {
             error: error, operation: operation, describe: configuration.describeError, detail: detail))
     }
 
+    /// Records that the user opened [screen]: a `navigation` breadcrumb of category `screen`
+    /// whose only data is `screen`, the raw value. Both profiles send it (the sanitizer keeps
+    /// the `screen` data key and strips the message). A no-op before `start`, while reporting
+    /// is off, or when the SDK isn't running, so nothing is recorded for an opted-out user.
+    public static func screen(_ screen: Screen) {
+        guard lock.withLock({ Self.configuration }) != nil,
+              ConsentGate.shared.isEnabled, SentrySDK.isEnabled else { return }
+        let crumb = Breadcrumb(level: .info, category: "screen")
+        crumb.type = "navigation"
+        crumb.setData(value: screen.rawValue, key: "screen")
+        SentrySDK.addBreadcrumb(crumb)
+    }
+
     /// The configuration when a log may be sent now: started, consent on, SDK running, and
     /// `logsEnabled`.
     static func canLog() -> CrashReportingConfiguration? {
@@ -423,6 +448,7 @@ public enum CrashReporting {
                     rate: rate)
             }
         }
+        options.maxBreadcrumbs = maxBreadcrumbs
         options.enableNetworkBreadcrumbs = false
         options.enableNetworkTracking = false
         options.enableFileIOTracing = false

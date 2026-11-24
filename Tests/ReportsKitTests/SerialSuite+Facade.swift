@@ -94,4 +94,59 @@ private final class ResolverFlag: @unchecked Sendable {
     private var _value = false
     var value: Bool { lock.withLock { _value } }
     func set() { lock.withLock { _value = true } }
+
+    @MainActor @Test func screenBreadcrumbsReachAnEventAsNameOnly() async throws {
+        let config = SDKHarness.reset()
+        CrashReporting.start(enabled: true, configuration: config)
+        // The SDK and the consent gate may still be starting; a screen marked before both are on is not recorded.
+        let deadline = Date().addingTimeInterval(5)
+        while !(SentrySDK.isEnabled && ConsentGate.shared.isEnabled), Date() < deadline { try await Task.sleep(nanoseconds: 20_000_000) }
+        SentrySDK.configureScope { $0.clearBreadcrumbs() }
+        CrashReporting.screen(.init("home"))
+        CrashReporting.screen(.init("scan.check"))
+        // A breadcrumb with a message and extra data, as an app could add through the SDK directly.
+        let stray = Breadcrumb(level: .info, category: "screen")
+        stray.message = "Jane's bill 86.40"
+        stray.setData(value: "Jane's bill 86.40", key: "title")
+        SentrySDK.addBreadcrumb(stray)
+        CrashReporting.capture(NSError(domain: NSCocoaErrorDomain, code: 4301), operation: .exportSave)
+        let envelopes = try SDKHarness.envelopes()
+        let event = try #require(await eventWithCode(4301))
+        let crumbs = try #require(event["breadcrumbs"] as? [[String: Any]])
+        let named = crumbs.compactMap { ($0["data"] as? [String: Any])?["screen"] as? String }
+        #expect(named == ["home", "scan.check"], "\(crumbs)")
+        for crumb in crumbs {
+            #expect(crumb["message"] == nil)
+            #expect(Set((crumb["data"] as? [String: Any] ?? [:]).keys).isSubset(of: ["screen", "state"]))
+        }
+        for envelope in envelopes {
+            #expect(!envelope.text.contains("Jane"))
+            #expect(!envelope.text.contains("86.40"))
+        }
+    }
+
+    @MainActor @Test func screenBeforeStartOrWhileOptedOutRecordsNothing() async throws {
+        let config = SDKHarness.reset()
+        CrashReporting.screen(.init("home"))
+        CrashReporting.start(enabled: false, configuration: config)
+        CrashReporting.screen(.init("settings"))
+        #expect(!SentrySDK.isEnabled)
+    }
+
+    @Test func theTrailKeepsTheLastTwenty() {
+        #expect(CrashReporting.maxBreadcrumbs == 20)
+    }
+
+    /// The delivered event of this test, found by its error code: an envelope of an earlier test can still
+    /// arrive late, and a flush that sees any event is not a barrier for this one.
+    @MainActor private func eventWithCode(_ code: Int) async -> [String: Any]? {
+        let deadline = Date().addingTimeInterval(8)
+        repeat {
+            await SDKHarness.flush()
+            let events = (try? SDKHarness.envelopes())?.flatMap(\.items) ?? []
+            if let found = events.first(where: { ($0.json?["tags"] as? [String: String])?["report.error"]?.contains("code=\(code)") == true })?.json { return found }
+            try? await Task.sleep(for: .milliseconds(100))
+        } while Date() < deadline
+        return nil
+    }
 }
